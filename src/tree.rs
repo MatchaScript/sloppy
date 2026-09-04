@@ -700,7 +700,19 @@ impl<V> Tree<V> {
     /// Every entry whose key starts with `p`, plus the watch of the node the
     /// descent along `p` reaches.
     #[must_use]
-    pub fn prefix(&self, p: &[u8]) -> (Iter<'_, V>, Watch) {
+    pub fn prefix(&self, p: &[u8]) -> Iter<'_, V> {
+        self.prefix_covering(p).0
+    }
+
+    /// The same, plus the watch of the node the descent along `p` reaches.
+    #[must_use]
+    pub fn prefix_watch(&self, p: &[u8]) -> (Iter<'_, V>, Watch) {
+        let (iter, node) = self.prefix_covering(p);
+        (iter, node.subtree.watch())
+    }
+
+    /// The entries under `p` and the node covering them, without a watch.
+    fn prefix_covering(&self, p: &[u8]) -> (Iter<'_, V>, &Node<V>) {
         let mut node: &Node<V> = &self.root;
         let mut key = Vec::new();
         let mut rest = p;
@@ -714,7 +726,7 @@ impl<V> Tree<V> {
                 } else {
                     Vec::new()
                 };
-                return (Iter { path: key, stack }, node.subtree.watch());
+                return (Iter { path: key, stack }, node);
             }
             if !rest.starts_with(&node.prefix) {
                 break;
@@ -731,7 +743,7 @@ impl<V> Tree<V> {
                 path: Vec::new(),
                 stack: Vec::new(),
             },
-            node.subtree.watch(),
+            node,
         )
     }
 
@@ -739,12 +751,6 @@ impl<V> Tree<V> {
     /// seeds the stack with the subtrees that are entirely `>= key`.
     #[must_use]
     pub fn lower_bound(&self, key: &[u8]) -> Iter<'_, V> {
-        self.lower_bound_watch(key).0
-    }
-
-    /// The same, plus the root watch: an entry can enter the range anywhere.
-    #[must_use]
-    pub fn lower_bound_watch(&self, key: &[u8]) -> (Iter<'_, V>, Watch) {
         let mut stack = Vec::new();
         let mut node: &Node<V> = &self.root;
         let mut acc: Vec<u8> = Vec::new();
@@ -787,7 +793,13 @@ impl<V> Tree<V> {
                 None => break,
             }
         }
-        (Iter { path: acc, stack }, self.root_watch())
+        Iter { path: acc, stack }
+    }
+
+    /// The same, plus the root watch: an entry can enter the range anywhere.
+    #[must_use]
+    pub fn lower_bound_watch(&self, key: &[u8]) -> (Iter<'_, V>, Watch) {
+        (self.lower_bound(key), self.root_watch())
     }
 
     /// Every entry, in ascending key order.

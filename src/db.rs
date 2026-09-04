@@ -47,6 +47,20 @@ fn row<V>((key, obj): (Vec<u8>, &Arc<Object<V>>)) -> (Vec<u8>, &V, Revision) {
     (key, obj.value.as_ref(), obj.revision)
 }
 
+/// Resolves index hits (index key, primary key) through the primary tree.
+fn resolve<'a, V>(
+    entry: &'a TableEntry<V>,
+    hits: tree::Iter<'a, Key>,
+) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
+    hits.map(move |(_, primary)| {
+        let object = entry
+            .primary
+            .value(primary)
+            .expect("index disagrees with the primary tree");
+        (primary.to_vec(), object.value.as_ref(), object.revision)
+    })
+}
+
 /// A secondary index: a name and the index keys one value is listed under.
 ///
 /// Non-unique. A value may yield zero, one, or several keys, and several values
@@ -413,7 +427,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         txn: &'a ReadTxn,
         prefix: &[u8],
     ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.prefix_watch(txn, prefix).0
+        self.entry(&txn.0).primary.prefix(prefix).map(row)
     }
 
     /// # Panics
@@ -427,7 +441,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V>,
         Watch,
     ) {
-        let (iter, watch) = self.entry(&txn.0).primary.prefix(prefix);
+        let (iter, watch) = self.entry(&txn.0).primary.prefix_watch(prefix);
         (iter.map(row), watch)
     }
 
@@ -441,7 +455,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         txn: &'a ReadTxn,
         key: &[u8],
     ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.lower_bound_watch(txn, key).0
+        self.entry(&txn.0).primary.lower_bound(key).map(row)
     }
 
     /// The same, plus a watch that fires on any change to the table: an entry
@@ -474,7 +488,9 @@ impl<V: Send + Sync + 'static> Table<V> {
         index: &'static str,
         key: &[u8],
     ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.by_index_watch(txn, index, key).0
+        let entry = self.entry(&txn.0);
+        let hits = self.index_tree(entry, index).prefix(&index_prefix(key));
+        resolve(entry, hits)
     }
 
     /// The same, plus a watch that fires when the entries under `key` change.
@@ -492,20 +508,19 @@ impl<V: Send + Sync + 'static> Table<V> {
         Watch,
     ) {
         let entry = self.entry(&txn.0);
+        let (hits, watch) = self
+            .index_tree(entry, index)
+            .prefix_watch(&index_prefix(key));
+        (resolve(entry, hits), watch)
+    }
+
+    fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<Key> {
         let pos = entry
             .index_defs
             .iter()
             .position(|i| i.name == index)
             .unwrap_or_else(|| panic!("table {} has no index {index}", self.name));
-        let (hits, watch) = entry.indexes[pos].prefix(&index_prefix(key));
-        let rows = hits.map(move |(_, primary)| {
-            let object = entry
-                .primary
-                .value(primary)
-                .expect("index disagrees with the primary tree");
-            (primary.to_vec(), object.value.as_ref(), object.revision)
-        });
-        (rows, watch)
+        &entry.indexes[pos]
     }
 
     /// # Panics
@@ -515,7 +530,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         &self,
         txn: &'a ReadTxn,
     ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.all_watch(txn).0
+        self.entry(&txn.0).primary.iter().map(row)
     }
 
     /// Every entry, plus a watch that fires on any change to the table.

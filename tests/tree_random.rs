@@ -85,7 +85,7 @@ fn matches_btreemap() {
         for _ in 0..2 {
             let p = rng.key();
             let want = model_entries(model.iter().filter(|(k, _)| k.starts_with(&p)));
-            let got: Vec<_> = tree.prefix(&p).0.map(|(k, v)| (k, **v)).collect();
+            let got: Vec<_> = tree.prefix(&p).map(|(k, v)| (k, **v)).collect();
             assert_eq!(got, want, "prefix {p:?}");
         }
         for _ in 0..2 {
@@ -134,14 +134,14 @@ fn watches_close_on_the_changed_path() {
     assert!(wz.is_closed());
 
     // A prefix watch closes when an entry appears under it.
-    let (empty, wp) = t3.prefix(b"b/");
+    let (empty, wp) = t3.prefix_watch(b"b/");
     assert_eq!(empty.count(), 0);
     let mut txn = t3.txn();
     txn.insert(b"b/x", 4);
     let t4 = txn.commit_and_notify();
     assert!(wp.is_closed());
 
-    let (found, wp) = t4.prefix(b"b/");
+    let (found, wp) = t4.prefix_watch(b"b/");
     assert_eq!(found.count(), 1);
     let mut txn = t4.txn();
     txn.insert(b"zz", 5);
