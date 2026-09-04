@@ -22,12 +22,14 @@ fn a_deep_chain_costs_no_stack() {
             txn.insert(&key, N + 1);
             tree = txn.commit_and_notify();
             assert_eq!(tree.len(), N + 1);
+            tree.assert_invariants();
 
             let mut txn = tree.txn();
             assert_eq!(*txn.delete(&key).unwrap(), N + 1);
             assert_eq!(*txn.delete(&key[..N]).unwrap(), N);
             tree = txn.commit_and_notify();
             assert_eq!(tree.len(), N - 1);
+            tree.assert_invariants();
             assert!(tree.get(&key[..N]).0.is_none());
             assert_eq!(**tree.get(&key[..N - 1]).0.unwrap(), N - 1);
         })

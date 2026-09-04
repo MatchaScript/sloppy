@@ -98,6 +98,18 @@ fn abort_leaves_nothing() {
 }
 
 #[test]
+#[should_panic(expected = "registration transaction did not commit")]
+fn a_change_reader_rejects_an_aborted_registration() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let mut w = db.write();
+    let mut reader = items.changes(&mut w);
+    drop(w);
+
+    let _ = reader.next(&db.read());
+}
+
+#[test]
 fn hook_sees_each_commit_once() {
     type Log = Vec<(Revision, Vec<(String, Revision, bool)>)>;
     let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(Vec::new()));
@@ -347,6 +359,50 @@ fn compact_spares_a_reader_that_lost_nothing() {
     let rev = w.commit();
     db.compact(rev);
     assert_eq!(reader.next(&db.read()).err().map(|e| e.at), Some(rev));
+}
+
+struct ReadsOnDrop(std::sync::Weak<Db>);
+
+impl Drop for ReadsOnDrop {
+    fn drop(&mut self) {
+        if let Some(db) = self.0.upgrade() {
+            drop(db.read());
+        }
+    }
+}
+
+fn reads_on_drop_key(_: &ReadsOnDrop) -> Key {
+    b"key".as_slice().into()
+}
+
+#[test]
+fn compact_drops_values_outside_the_root_lock() {
+    let db = Arc::new(Db::new());
+    let items = db.table("items", reads_on_drop_key as fn(&ReadsOnDrop) -> Key, &[]);
+
+    let mut w = db.write();
+    let _reader = items.changes(&mut w);
+    w.commit();
+
+    let mut w = db.write();
+    items.insert(&mut w, ReadsOnDrop(Arc::downgrade(&db)));
+    w.commit();
+
+    let mut w = db.write();
+    let deleted = items.delete(&mut w, b"key").unwrap();
+    let revision = w.commit();
+    drop(deleted);
+
+    let (done, completed) = std::sync::mpsc::channel();
+    let compacting = db.clone();
+    let thread = std::thread::spawn(move || {
+        compacting.compact(revision);
+        done.send(()).unwrap();
+    });
+    completed
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("compact deadlocked while dropping a value");
+    thread.join().unwrap();
 }
 
 #[test]
@@ -703,6 +759,13 @@ fn an_unknown_index_is_a_programming_error() {
 }
 
 #[test]
+#[should_panic(expected = "table rows has duplicate index tenant")]
+fn duplicate_index_names_are_rejected() {
+    let db = Db::new();
+    let _ = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT, BY_TENANT]);
+}
+
+#[test]
 #[should_panic(expected = "belongs to another Db")]
 fn table_handle_rejects_another_db() {
     let a = Db::new();
@@ -710,4 +773,17 @@ fn table_handle_rejects_another_db() {
     let ta = a.table("t", pk as fn(&Item) -> Key, &[]);
     let _tb = b.table("t", pk as fn(&Item) -> Key, &[]);
     let _ = ta.get(&b.read(), b"k");
+}
+
+#[test]
+#[should_panic(expected = "belongs to another Db")]
+fn table_handle_rejects_another_db_after_its_slot_was_opened() {
+    let a = Db::new();
+    let b = Db::new();
+    let ta = a.table("t", pk as fn(&Item) -> Key, &[]);
+    let tb = b.table("t", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = b.write();
+    tb.insert(&mut w, item("local", 1));
+    ta.insert(&mut w, item("foreign", 2));
 }

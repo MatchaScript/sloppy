@@ -1,7 +1,7 @@
 //! The database: tables, snapshot reads, single-writer transactions.
 //!
 //! One revision counter covers the whole `Db`. A commit that changes anything
-//! bumps it by one, builds a new [`Root`] and swaps it in behind an `RwLock`
+//! bumps it by one, builds a new root and swaps it in behind an `RwLock`
 //! held only for the assignment, so readers never see a half-applied commit and
 //! never block the writer.
 
@@ -283,11 +283,21 @@ impl Db {
             .clone()
     }
 
-    fn install(&self, root: Root) {
-        *self.root.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(root);
+    fn install(&self, root: Arc<Root>) {
+        let old = {
+            let mut current = self.root.write().unwrap_or_else(PoisonError::into_inner);
+            std::mem::replace(&mut *current, root)
+        };
+        // A value's destructor may read this Db, so the old root must outlive
+        // the root write guard.
+        drop(old);
     }
 
     /// Registers a table. Takes the writer lock and does not bump the revision.
+    ///
+    /// # Panics
+    ///
+    /// If two indexes have the same name.
     pub fn table<V: Send + Sync + 'static>(
         &self,
         name: &'static str,
@@ -295,12 +305,19 @@ impl Db {
         indexes: &[Index<V>],
     ) -> Table<V> {
         let _guard = lock(&self.write);
+        for (at, index) in indexes.iter().enumerate() {
+            assert!(
+                indexes[..at].iter().all(|other| other.name != index.name),
+                "table {name} has duplicate index {}",
+                index.name
+            );
+        }
         let mut root = (*self.snapshot()).clone();
         let pos = root.tables.len();
         root.tables
             .push(Arc::new(TableEntry::new(primary_key, indexes.to_vec())));
         let db = root.db;
-        self.install(root);
+        self.install(Arc::new(root));
         Table {
             db,
             pos,
@@ -346,7 +363,7 @@ impl Db {
                 *table = new;
             }
         }
-        self.install(root);
+        self.install(Arc::new(root));
     }
 }
 
@@ -501,7 +518,9 @@ impl<V: Send + Sync + 'static> Table<V> {
         resolve(entry, hits)
     }
 
-    /// The same, plus a watch that fires when the entries under `key` change.
+    /// The same, plus a watch that fires when the primary keys listed under
+    /// `key` change. Rewriting a value without changing its index membership
+    /// does not fire it.
     ///
     /// # Panics
     ///
@@ -570,8 +589,8 @@ impl<V: Send + Sync + 'static> Table<V> {
 
     /// The working copy of this table, opened on first use.
     fn pending<'t>(&self, txn: &'t mut WriteTxn<'_>) -> &'t mut Pending<V> {
+        let entry = self.entry(&txn.root);
         if txn.pending[self.pos].is_none() {
-            let entry = self.entry(&txn.root);
             let pending = Pending {
                 revision: entry.revision,
                 written: false,
@@ -673,14 +692,15 @@ impl<V: Send + Sync + 'static> Table<V> {
     }
 
     /// Registers a change reader that observes this table as of the commit that
-    /// installs it. Until `txn` commits the reader holds nothing back.
+    /// installs it. The returned reader may only be used after `txn` commits;
+    /// until then it holds nothing back.
     ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
     pub fn changes(&self, txn: &mut WriteTxn<'_>) -> ChangeIterator<V> {
         let pending = self.pending(txn);
-        let tracker = Arc::new(AtomicU64::new(pending.revision));
+        let tracker = Arc::new(AtomicU64::new(UNREGISTERED));
         pending.new_trackers.push(tracker.clone());
         ChangeIterator {
             table: *self,
@@ -807,7 +827,7 @@ impl WriteTxn<'_> {
         root.revision = revision;
 
         let snapshot = Arc::new(root);
-        *db.root.write().unwrap_or_else(PoisonError::into_inner) = snapshot.clone();
+        db.install(snapshot.clone());
         closed.close();
         if dirty {
             let txn = ReadTxn(snapshot);
@@ -849,6 +869,8 @@ pub struct ChangeIterator<V> {
     tracker: Arc<AtomicU64>,
 }
 
+const UNREGISTERED: Revision = Revision::MAX;
+
 impl<V: Send + Sync + 'static> ChangeIterator<V> {
     /// The changes between the last observed revision and `txn`, in revision
     /// order, plus a watch that fires on the next change to the table.
@@ -863,12 +885,17 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
     ///
     /// # Panics
     ///
-    /// If the table was not registered in this `Db`.
+    /// If the registration transaction has not committed, was aborted, or the
+    /// table was not registered in this `Db`.
     pub fn next<'a>(
         &mut self,
         txn: &'a ReadTxn,
     ) -> Result<(impl Iterator<Item = Change<V>> + use<'a, V>, Watch), Compacted> {
         let observed = self.tracker.load(Ordering::Relaxed);
+        assert_ne!(
+            observed, UNREGISTERED,
+            "change reader's registration transaction did not commit"
+        );
         let entry = self.table.entry(&txn.0);
         if observed < entry.lost {
             return Err(Compacted { at: entry.lost });

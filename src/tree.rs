@@ -593,6 +593,8 @@ impl<V> Children<V> {
                 (17..=48).contains(&len)
             }
             Self::N256(n) => {
+                let listed = n.slots.iter().flatten().count();
+                assert_eq!(listed, len, "node256 holds {listed} of {len} children");
                 for (byte, slot) in n.slots.iter().enumerate() {
                     if let Some(child) = slot {
                         assert_eq!(usize::from(child.key()), byte, "node256 child out of place");
@@ -612,6 +614,12 @@ impl<V> Children<V> {
 
 impl<V, const K: usize> Sorted<V, K> {
     fn assert_keys(&self) {
+        assert!(
+            self.slots[usize::from(self.len)..]
+                .iter()
+                .all(Option::is_none),
+            "sorted node has children past its len"
+        );
         for (key, slot) in self.keys.iter().zip(self.occupied()) {
             assert_eq!(
                 *key,
@@ -857,21 +865,22 @@ impl<V> Tree<V> {
     /// its kind, its order, or its own lookup structures.
     #[doc(hidden)]
     pub fn assert_invariants(&self) {
-        fn walk<V>(node: &Node<V>, root: bool) {
-            assert!(
-                root || !node.prefix.is_empty(),
-                "empty prefix below the root"
-            );
-            assert!(
-                root || node.value.is_some() || node.children.len() >= 2,
-                "node with no value and fewer than two children"
-            );
+        assert!(self.root.prefix.is_empty(), "non-empty root prefix");
+        let mut values = 0;
+        let mut stack = vec![self.root.as_ref()];
+        while let Some(node) = stack.pop() {
             node.children.assert_ok();
+            values += usize::from(node.value.is_some());
             for child in node.children.iter() {
-                walk(child, false);
+                assert!(!child.prefix.is_empty(), "empty prefix below the root");
+                assert!(
+                    child.value.is_some() || child.children.len() >= 2,
+                    "node with no value and fewer than two children"
+                );
+                stack.push(child);
             }
         }
-        walk(&self.root, true);
+        assert_eq!(values, self.len, "tree len disagrees with its values");
     }
 }
 

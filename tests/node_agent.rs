@@ -1,8 +1,7 @@
 //! Row 6: the node agent's R1-R5, with one writer and three readers running
 //! side by side.
 //!
-//! R1 readers never block on the writer: every reader records the wall time of
-//! its slowest single read.
+//! R1 readers never block on an open write transaction.
 //! R2/R3 the differ rebuilds the table from `changes` alone, deletions
 //! included, and ends up with what `all()` holds.
 //! R4 the differ sleeps on a `Watch` between rounds instead of spinning.
@@ -23,8 +22,6 @@ const TENANTS: [&str; 4] = ["red", "green", "blue", "violet"];
 const SENTINEL: &[u8] = b"k/done";
 /// Value of `finish` while the writer still has commits to make.
 const RUNNING: u64 = 0;
-/// One read must stay far under the time the writer runs for.
-const READ_LIMIT: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct Rec {
@@ -77,7 +74,28 @@ fn apply(map: &mut BTreeMap<Vec<u8>, u64>, changes: impl Iterator<Item = Change<
 struct Reads {
     name: &'static str,
     loops: usize,
-    worst: Duration,
+}
+
+#[test]
+fn a_read_does_not_wait_for_an_open_write_transaction() {
+    let db = Arc::new(Db::new());
+    let table = db.table("recs", rec_key as fn(&Rec) -> Key, &[]);
+    let reading = db.clone();
+    let write = db.write();
+
+    let completed = thread::scope(|scope| {
+        let (ready, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            ready.send(()).unwrap();
+            done.send(table.all(&reading.read()).count()).unwrap();
+        });
+        started.recv().unwrap();
+        let completed = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+        drop(write);
+        completed
+    });
+    assert!(completed, "read waited for the open write transaction");
 }
 
 #[test]
@@ -143,14 +161,11 @@ fn readers_keep_up_with_a_busy_writer() {
             let mut reads = Reads {
                 name: "differ",
                 loops: 0,
-                worst: Duration::ZERO,
             };
             loop {
                 let snapshot = db.read();
-                let at = Instant::now();
                 let (changes, mut watch) = differ_iter.next(&snapshot).expect("nothing compacted");
                 apply(&mut map, changes);
-                reads.worst = reads.worst.max(at.elapsed());
                 reads.loops += 1;
                 let last = finish.load(Ordering::SeqCst);
                 if last != RUNNING && snapshot.revision() >= last {
@@ -168,13 +183,10 @@ fn readers_keep_up_with_a_busy_writer() {
             let mut reads = Reads {
                 name: "scanner",
                 loops: 0,
-                worst: Duration::ZERO,
             };
             while finish.load(Ordering::SeqCst) == RUNNING {
                 let snapshot = db.read();
-                let at = Instant::now();
                 let seen = table.all(&snapshot).count();
-                reads.worst = reads.worst.max(at.elapsed());
                 reads.loops += 1;
                 assert!(seen <= usize::try_from(KEYS).unwrap() + 1);
             }
@@ -188,16 +200,13 @@ fn readers_keep_up_with_a_busy_writer() {
             let mut reads = Reads {
                 name: "index reader",
                 loops: 0,
-                worst: Duration::ZERO,
             };
             while finish.load(Ordering::SeqCst) == RUNNING {
                 let snapshot = db.read();
-                let at = Instant::now();
                 let listed: Vec<_> = table
                     .by_index(&snapshot, "tenant", TENANTS[0].as_bytes())
                     .map(|(k, v, _)| (k, v.n))
                     .collect();
-                reads.worst = reads.worst.max(at.elapsed());
                 reads.loops += 1;
                 assert!(listed.len() <= usize::try_from(KEYS).unwrap() + 1);
             }
@@ -213,24 +222,9 @@ fn readers_keep_up_with_a_busy_writer() {
         by_tenant.join().unwrap(),
     ];
 
-    // R1: no read waited on the writer.
     println!("writer: {writing:?} for {COMMITS} commits");
     for r in &measured {
-        println!("{}: {} reads, worst {:?}", r.name, r.loops, r.worst);
-    }
-    for r in &measured {
-        assert!(
-            r.worst < READ_LIMIT,
-            "{} blocked for {:?} while the writer ran for {writing:?}",
-            r.name,
-            r.worst
-        );
-        assert!(
-            r.loops > 20,
-            "{} only got through {} reads while the writer ran for {writing:?}",
-            r.name,
-            r.loops
-        );
+        println!("{}: {} reads", r.name, r.loops);
     }
     // R4: a round happens per commit at most, so the differ waited, not spun.
     assert!(measured[0].loops <= COMMITS + 2, "the differ spun");
