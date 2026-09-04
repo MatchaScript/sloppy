@@ -313,3 +313,45 @@ fn a_batched_txn_matches_separate_txns() {
     assert_eq!(before.len(), 3);
     before.assert_invariants();
 }
+
+/// `Cell::watch` and the commit that closes the cell must not miss each other.
+/// Both go through the cell's lock, so whichever runs second sees the work of
+/// the first and a watch handed out around a closing commit is complete once
+/// both have returned. The two-atomic version this replaced could let each side
+/// read the other's stale value on a weakly ordered machine, leaving a watch on
+/// a node already out of the tree that no later commit would ever close.
+#[test]
+fn a_watch_racing_the_commit_that_closes_it_still_closes() {
+    use std::sync::{Arc, Barrier};
+
+    for _ in 0..2000 {
+        let mut txn = Tree::new().txn();
+        txn.insert(b"a", 1);
+        let t0 = Arc::new(txn.commit_and_notify());
+        let gate = Arc::new(Barrier::new(2));
+
+        let reader = {
+            let (t0, gate) = (t0.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                t0.get(b"a").1
+            })
+        };
+        let writer = {
+            let (t0, gate) = (t0.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                let mut txn = t0.txn();
+                txn.insert(b"a", 2);
+                drop(txn.commit_and_notify());
+            })
+        };
+
+        writer.join().unwrap();
+        let watch = reader.join().unwrap();
+        assert!(
+            watch.is_closed(),
+            "the commit closed the cell this watch was taken on"
+        );
+    }
+}

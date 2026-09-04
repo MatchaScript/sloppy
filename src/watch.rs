@@ -6,34 +6,47 @@
 //!
 //! The channel behind a cell is allocated on the first `Watch`, so a tree
 //! nobody watches allocates none. A cell that is closed before it ever had a
-//! channel keeps the fact in `replaced`: a reader on an old snapshot that
+//! channel keeps the fact in its state: a reader on an old snapshot that
 //! subscribes only afterwards gets a `Watch` that is already complete, which no
 //! later commit would ever close for it.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use tokio::sync::watch;
 
 /// One node's notification cell.
 #[derive(Debug, Default)]
 pub(crate) struct Cell {
-    replaced: AtomicBool,
-    sender: OnceLock<watch::Sender<bool>>,
+    state: Mutex<State>,
+}
+
+/// A cell holds no channel until the first watcher asks for one, and none again
+/// once it is closed.
+#[derive(Debug, Default)]
+enum State {
+    #[default]
+    Fresh,
+    Watched(watch::Sender<bool>),
+    Closed,
 }
 
 impl Cell {
     /// A watch on this cell, already complete if the node is gone.
     pub(crate) fn watch(&self) -> Watch {
-        let sender = self.sender.get_or_init(|| watch::channel(false).0);
-        let watch = Watch(sender.subscribe());
-        // Read after subscribing, against a `close` that writes the flag before
-        // it looks for the channel: whichever of the two runs second sees the
-        // work of the first.
-        if self.replaced.load(Ordering::Acquire) {
-            sender.send_replace(true);
+        // One lock covers both the channel and the closed flag, so a `watch`
+        // and a `close` that race cannot each miss the other.
+        let mut state = self.state.lock().expect("a cell holds no panicking code");
+        match &*state {
+            State::Watched(sender) => Watch(sender.subscribe()),
+            // The sender is dropped with the channel it was made for: the
+            // receiver already carries the closed value.
+            State::Closed => Watch(watch::channel(true).1),
+            State::Fresh => {
+                let (sender, receiver) = watch::channel(false);
+                *state = State::Watched(sender);
+                Watch(receiver)
+            }
         }
-        watch
     }
 }
 
@@ -70,8 +83,8 @@ impl Closed {
 
 impl Closes for Cell {
     fn close(&self) {
-        self.replaced.store(true, Ordering::Release);
-        if let Some(sender) = self.sender.get() {
+        let mut state = self.state.lock().expect("a cell holds no panicking code");
+        if let State::Watched(sender) = std::mem::replace(&mut *state, State::Closed) {
             sender.send_replace(true);
         }
     }
