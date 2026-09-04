@@ -188,8 +188,9 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
             revision: self.revision,
             primary: self.primary.clone(),
             rev_index: self.rev_index.clone(),
-            // Nothing outside this module watches the graveyard, so its cells
-            // are closed here rather than after the root swap.
+            // Nobody takes a watch on the graveyard - this module reads it
+            // with `value` - so its cells are closed here rather than after
+            // the root swap.
             graveyard: graveyard.commit_and_notify(),
             graveyard_rev: graveyard_rev.commit_and_notify(),
             indexes: self.indexes.clone(),
@@ -387,7 +388,8 @@ impl<V: Send + Sync + 'static> Table<V> {
     /// If the table was not registered in this `Db`.
     #[must_use]
     pub fn get<'a>(&self, txn: &'a ReadTxn, key: &[u8]) -> Option<(&'a V, Revision)> {
-        self.get_watch(txn, key).0
+        let object = self.entry(&txn.0).primary.value(key)?;
+        Some((object.value.as_ref(), object.revision))
     }
 
     /// # Panics
@@ -496,13 +498,10 @@ impl<V: Send + Sync + 'static> Table<V> {
             .position(|i| i.name == index)
             .unwrap_or_else(|| panic!("table {} has no index {index}", self.name));
         let (hits, watch) = entry.indexes[pos].prefix(&index_prefix(key));
-        // ponytail: resolving a hit builds and drops one `Watch`. Give the tree
-        // a plain lookup if index scans ever show up in a measurement.
         let rows = hits.map(move |(_, primary)| {
             let object = entry
                 .primary
-                .get(primary)
-                .0
+                .value(primary)
                 .expect("index disagrees with the primary tree");
             (primary.to_vec(), object.value.as_ref(), object.revision)
         });
@@ -721,7 +720,8 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
         Arc::new(TableEntry {
             revision,
             primary,
-            // The index trees carry no watch anyone can hold.
+            // Nobody takes a watch on these three; the secondary indexes
+            // above, which `by_index_watch` hands out, close after the swap.
             rev_index: this.rev_index.commit_and_notify(),
             graveyard: this.graveyard.commit_and_notify(),
             graveyard_rev: this.graveyard_rev.commit_and_notify(),
@@ -902,8 +902,7 @@ impl<V> Iterator for Changes<'_, V> {
         }
         .expect("peeked");
         let object = tree
-            .get(key)
-            .0
+            .value(key)
             .expect("revision index disagrees with its tree");
         Some(Change {
             key: (**key).clone(),

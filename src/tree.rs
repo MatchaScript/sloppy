@@ -676,6 +676,13 @@ impl<V> Tree<V> {
         self.root.subtree.watch()
     }
 
+    /// The value at `key`, without watching anything: a reader that would drop
+    /// the `Watch` should not make the cell allocate a channel.
+    #[must_use]
+    pub fn value(&self, key: &[u8]) -> Option<&Arc<V>> {
+        descend(&self.root, key).0
+    }
+
     /// The value at `key`, plus a watch on that value alone - or, when `key`
     /// is absent, on the whole subtree of the deepest node the descent reached,
     /// which is where the key would appear.
@@ -1053,5 +1060,28 @@ mod layout {
             "the inline prefix should fill the heap variant, no more"
         );
         assert!(size_of::<Node<u64>>() <= 120, "the node grew a word");
+    }
+}
+
+#[cfg(test)]
+mod lookup {
+    use super::{Tree, descend};
+
+    /// The read paths that drop the watch go through `value`, which must leave
+    /// the cell without a channel: one allocation per row otherwise, kept for
+    /// as long as the cell rides across node rebuilds.
+    #[test]
+    fn a_plain_lookup_allocates_no_channel() {
+        let mut txn = Tree::new().txn();
+        txn.insert(b"a", 1u64);
+        let tree = txn.commit_and_notify();
+
+        assert_eq!(tree.value(b"a").map(|v| **v), Some(1));
+        let node = descend(&tree.root, b"a").1;
+        assert!(!node.value_cell.has_channel(), "`value` watches nothing");
+
+        let (_, watch) = tree.get(b"a");
+        assert!(node.value_cell.has_channel(), "`get` hands out a watch");
+        drop(watch);
     }
 }

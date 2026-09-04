@@ -48,6 +48,14 @@ impl Cell {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_channel(&self) -> bool {
+        matches!(
+            *self.state.lock().expect("a cell holds no panicking code"),
+            State::Watched(_)
+        )
+    }
 }
 
 /// What a commit completes once the new root is in place: the cell of a node it
