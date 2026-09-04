@@ -15,3 +15,6 @@ unsafe_code = "deny"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["sync", "rt", "macros"] }
