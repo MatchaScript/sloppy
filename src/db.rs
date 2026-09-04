@@ -221,6 +221,8 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
 /// Everything a snapshot is: swapped as one `Arc`.
 #[derive(Clone)]
 struct Root {
+    /// Identifies the `Db`; a [`Table`] handle carries the same id.
+    db: u64,
     revision: Revision,
     /// History below this revision is gone; see [`Db::compact`].
     compacted: Revision,
@@ -261,8 +263,10 @@ impl Db {
     /// still held. It must not write to this `Db`; a panic in it propagates out
     /// of `commit`.
     pub fn with_hook(hook: impl FnMut(Revision, &ReadTxn) + Send + 'static) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             root: RwLock::new(Arc::new(Root {
+                db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 revision: 0,
                 compacted: 0,
                 tables: Vec::new(),
@@ -295,8 +299,10 @@ impl Db {
         let pos = root.tables.len();
         root.tables
             .push(Arc::new(TableEntry::new(primary_key, indexes.to_vec())));
+        let db = root.db;
         self.install(root);
         Table {
+            db,
             pos,
             name,
             _v: PhantomData,
@@ -349,6 +355,7 @@ impl Db {
 /// A handle to a registered table. Cheap to copy; valid only for the `Db` that
 /// returned it.
 pub struct Table<V> {
+    db: u64,
     pos: usize,
     name: &'static str,
     _v: PhantomData<V>,
@@ -378,6 +385,7 @@ impl<V: Send + Sync + 'static> Table<V> {
     fn entry<'a>(&self, root: &'a Root) -> &'a TableEntry<V> {
         root.tables
             .get(self.pos)
+            .filter(|_| root.db == self.db)
             .and_then(|t| t.as_any().downcast_ref())
             .unwrap_or_else(|| panic!("table {} belongs to another Db or value type", self.name))
     }

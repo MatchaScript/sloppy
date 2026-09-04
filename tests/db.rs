@@ -701,3 +701,13 @@ fn an_unknown_index_is_a_programming_error() {
     let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
     let _ = rows.by_index(&db.read(), "colour", b"a").count();
 }
+
+#[test]
+#[should_panic(expected = "belongs to another Db")]
+fn table_handle_rejects_another_db() {
+    let a = Db::new();
+    let b = Db::new();
+    let ta = a.table("t", pk as fn(&Item) -> Key, &[]);
+    let _tb = b.table("t", pk as fn(&Item) -> Key, &[]);
+    let _ = ta.get(&b.read(), b"k");
+}
