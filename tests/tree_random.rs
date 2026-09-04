@@ -187,3 +187,43 @@ fn a_value_watch_ignores_the_rest_of_the_subtree() {
     assert!(!wab.is_closed());
     assert_eq!(t3.len(), 2);
 }
+
+/// One node through every kind: 4 -> 16 -> 48 -> 256 on the way up and back
+/// down again, checked against the model after every single write.
+#[test]
+fn one_node_grows_and_shrinks_through_every_kind() {
+    let mut tree: Tree<u64> = Tree::new();
+    let mut model: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+
+    // The prefix carries a value of its own, so the node survives losing all
+    // but one child instead of being merged away.
+    let mut keys = vec![b"k".to_vec()];
+    keys.extend((0..=255u8).map(|byte| vec![b'k', byte]));
+
+    for (i, key) in keys.iter().enumerate() {
+        let stamp = u64::try_from(i).unwrap();
+        let mut txn = tree.txn();
+        assert_eq!(txn.insert(key, stamp), None);
+        tree = txn.commit_and_notify();
+        model.insert(key.clone(), stamp);
+        tree.assert_invariants();
+        assert_eq!(tree.len(), model.len());
+        assert_eq!(entries(&tree), model_entries(model.iter()));
+    }
+    assert_eq!(tree.len(), 257, "the node holds all 256 children");
+
+    // Back down to one child, from the middle outwards so the removals do not
+    // all fall at one end of the node.
+    let mut order: Vec<&Vec<u8>> = keys[1..].iter().collect();
+    order.sort_by_key(|key| key[1].wrapping_sub(128));
+    for key in order.iter().take(255) {
+        let mut txn = tree.txn();
+        assert!(txn.delete(key).is_some());
+        tree = txn.commit_and_notify();
+        model.remove(*key);
+        tree.assert_invariants();
+        assert_eq!(tree.len(), model.len());
+        assert_eq!(entries(&tree), model_entries(model.iter()));
+    }
+    assert_eq!(tree.len(), 2, "the prefix and its last child");
+}
