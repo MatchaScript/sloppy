@@ -17,17 +17,44 @@ struct Node<V> {
     /// Sorted and unique by the first byte of the child's prefix, which the
     /// `u8` duplicates so the search does not chase the `Arc`.
     children: Vec<(u8, Arc<Node<V>>)>,
+    /// Closed by every commit that rebuilds this node, so it covers the whole
+    /// subtree.
     watch: WatchCell,
+    /// Closed only by a commit that writes or removes this node's own value.
+    value_watch: WatchCell,
 }
 
 impl<V> Node<V> {
+    /// The value is new here, so its cell starts fresh.
     fn new(prefix: &[u8], value: Option<Arc<V>>, children: Vec<(u8, Arc<Node<V>>)>) -> Arc<Self> {
+        Self::carrying(prefix, value, cell(), children)
+    }
+
+    /// The value comes over unchanged from another node and keeps that node's
+    /// cell, so a `Watch` taken there still tracks it.
+    fn carrying(
+        prefix: &[u8],
+        value: Option<Arc<V>>,
+        value_watch: WatchCell,
+        children: Vec<(u8, Arc<Node<V>>)>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             prefix: prefix.into(),
             value,
             children,
             watch: cell(),
+            value_watch,
         })
+    }
+
+    /// Path copy of `self`: the value and its cell carry over.
+    fn with_children(&self, prefix: &[u8], children: Vec<(u8, Arc<Node<V>>)>) -> Arc<Self> {
+        Self::carrying(
+            prefix,
+            self.value.clone(),
+            self.value_watch.clone(),
+            children,
+        )
     }
 
     fn child(&self, byte: u8) -> Result<usize, usize> {
@@ -105,12 +132,18 @@ impl<V> Tree<V> {
         Watch::new(&self.root.watch)
     }
 
-    /// The value at `key`, plus the watch of the node holding it - or, when
-    /// `key` is absent, of the deepest node on the descent.
+    /// The value at `key`, plus a watch on that value alone - or, when `key`
+    /// is absent, on the whole subtree of the deepest node the descent reached,
+    /// which is where the key would appear.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> (Option<&Arc<V>>, Watch) {
         let (value, node) = descend(&self.root, key);
-        (value, Watch::new(&node.watch))
+        let watch = if value.is_some() {
+            &node.value_watch
+        } else {
+            &node.watch
+        };
+        (value, Watch::new(watch))
     }
 
     /// Every entry whose key starts with `p`, plus the watch of the node the
@@ -146,6 +179,12 @@ impl<V> Tree<V> {
     /// seeds the stack with the subtrees that are entirely `>= key`.
     #[must_use]
     pub fn lower_bound(&self, key: &[u8]) -> Iter<'_, V> {
+        self.lower_bound_watch(key).0
+    }
+
+    /// The same, plus the root watch: an entry can enter the range anywhere.
+    #[must_use]
+    pub fn lower_bound_watch(&self, key: &[u8]) -> (Iter<'_, V>, Watch) {
         let mut stack = Vec::new();
         let mut node: &Node<V> = &self.root;
         let mut acc: Vec<u8> = Vec::new();
@@ -186,7 +225,7 @@ impl<V> Tree<V> {
                 None => break,
             }
         }
-        Iter { stack }
+        (Iter { stack }, self.root_watch())
     }
 
     /// Every entry, in ascending key order.
@@ -345,11 +384,7 @@ fn insert<V>(
 
     if common < node.prefix.len() {
         // The key diverges inside the prefix: split, the tail keeps the subtree.
-        let tail = Node::new(
-            &node.prefix[common..],
-            node.value.clone(),
-            node.children.clone(),
-        );
+        let tail = node.with_children(&node.prefix[common..], node.children.clone());
         if common == key.len() {
             let children = vec![(tail.prefix[0], tail)];
             return (Node::new(&key[..common], Some(value), children), None);
@@ -362,6 +397,10 @@ fn insert<V>(
 
     if common == key.len() {
         let old = node.value.clone();
+        // On a valueless node this closes a cell nobody holds: `get` hands out
+        // the value cell only for a key that exists, and the watch on the
+        // missing key is the subtree cell closed above.
+        closed.push(node.value_watch.clone());
         let new = Node::new(&node.prefix, Some(value), node.children.clone());
         return (new, old);
     }
@@ -379,7 +418,7 @@ fn insert<V>(
             None
         }
     };
-    (Node::new(&node.prefix, node.value.clone(), children), old)
+    (node.with_children(&node.prefix, children), old)
 }
 
 /// Path-copies `node` with `key` (relative to `node`) removed. A `None` node
@@ -401,6 +440,7 @@ fn delete<V>(
             return (None, None);
         };
         closed.push(node.watch.clone());
+        closed.push(node.value_watch.clone());
         let children = node.children.clone();
         return (
             shrink(&node.prefix, None, children, is_root, closed),
@@ -421,7 +461,7 @@ fn delete<V>(
         Some(c) => children[i] = (c.prefix[0], c),
         None => drop(children.remove(i)),
     }
-    let value = node.value.clone();
+    let value = node.value.clone().map(|v| (v, node.value_watch.clone()));
     (
         shrink(&node.prefix, value, children, is_root, closed),
         Some(old),
@@ -433,7 +473,7 @@ fn delete<V>(
 /// into that child. The root always stays, with an empty prefix.
 fn shrink<V>(
     prefix: &[u8],
-    value: Option<Arc<V>>,
+    value: Option<(Arc<V>, WatchCell)>,
     children: Vec<(u8, Arc<Node<V>>)>,
     is_root: bool,
     closed: &mut Vec<WatchCell>,
@@ -446,12 +486,14 @@ fn shrink<V>(
             closed.push(only.watch.clone());
             let mut merged = prefix.to_vec();
             merged.extend_from_slice(&only.prefix);
-            return Some(Node::new(
-                &merged,
-                only.value.clone(),
-                only.children.clone(),
-            ));
+            return Some(only.with_children(&merged, only.children.clone()));
         }
     }
-    Some(Node::new(prefix, value, children))
+    let (value, watch) = value.unzip();
+    Some(Node::carrying(
+        prefix,
+        value,
+        watch.unwrap_or_else(cell),
+        children,
+    ))
 }

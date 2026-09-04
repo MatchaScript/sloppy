@@ -149,3 +149,41 @@ fn watches_close_on_the_changed_path() {
     assert!(!wp.is_closed());
     assert_eq!(t5.len(), 3);
 }
+
+#[test]
+fn a_value_watch_ignores_the_rest_of_the_subtree() {
+    let mut txn = Tree::new().txn();
+    txn.insert(b"a", 1);
+    txn.insert(b"ab", 2);
+    let t0 = txn.commit_and_notify();
+
+    // A key gaining a descendant is not a change to that key's value.
+    let (_, wa) = t0.get(b"a");
+    let (_, wab) = t0.get(b"ab");
+    let (_, wabc) = t0.get(b"abc");
+    let mut txn = t0.txn();
+    txn.insert(b"abc", 3);
+    let t1 = txn.commit_and_notify();
+    assert!(!wa.is_closed());
+    assert!(!wab.is_closed());
+    assert!(wabc.is_closed(), "the missing key appeared");
+
+    // Replacing a value closes that value's watch alone.
+    let (_, wa) = t1.get(b"a");
+    let (_, wab) = t1.get(b"ab");
+    let mut txn = t1.txn();
+    txn.insert(b"a", 11);
+    let t2 = txn.commit_and_notify();
+    assert!(wa.is_closed());
+    assert!(!wab.is_closed());
+
+    // Deleting "a" merges its node into "ab", which keeps its own cell.
+    let (_, wa) = t2.get(b"a");
+    let (_, wab) = t2.get(b"ab");
+    let mut txn = t2.txn();
+    txn.delete(b"a");
+    let t3 = txn.commit_and_notify();
+    assert!(wa.is_closed());
+    assert!(!wab.is_closed());
+    assert_eq!(t3.len(), 2);
+}

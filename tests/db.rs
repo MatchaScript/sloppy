@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use sloppy::db::{Change, ChangeIterator, Db, Key, ReadTxn, Revision, Table};
+use sloppy::db::{Change, ChangeIterator, Db, Index, Key, ReadTxn, Revision, Table};
 
 #[derive(Debug)]
 struct Item {
@@ -35,7 +35,7 @@ fn drain<I: Iterator<Item = Change<Item>>>(changes: I) -> Vec<(String, Revision,
 #[test]
 fn snapshots_hold_their_version() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -76,7 +76,7 @@ fn abort_leaves_nothing() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let seen = calls.clone();
     let db = Db::with_hook(move |rev: Revision, _: &ReadTxn| seen.lock().unwrap().push(rev));
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -112,7 +112,7 @@ fn hook_sees_each_commit_once() {
             .unwrap_or_default();
         log_in.lock().unwrap().push((rev, changes));
     });
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -145,8 +145,8 @@ fn hook_sees_each_commit_once() {
 #[test]
 fn table_revision_tracks_its_own_writes() {
     let db = Db::new();
-    let one = db.table("one", pk as fn(&Item) -> Key);
-    let two = db.table("two", pk as fn(&Item) -> Key);
+    let one = db.table("one", pk as fn(&Item) -> Key, &[]);
+    let two = db.table("two", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     one.insert(&mut w, item("a", 1));
@@ -178,7 +178,7 @@ fn observe(db: &Db, items: Table<Item>) -> ChangeIterator<Item> {
 #[test]
 fn changes_report_the_last_state_of_each_key() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -224,7 +224,7 @@ fn changes_report_the_last_state_of_each_key() {
 #[test]
 fn graveyard_holds_until_every_reader_has_read() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -261,7 +261,7 @@ fn graveyard_holds_until_every_reader_has_read() {
 #[test]
 fn dropping_a_reader_releases_the_graveyard() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -283,7 +283,7 @@ fn dropping_a_reader_releases_the_graveyard() {
 #[test]
 fn no_reader_means_no_graveyard() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -298,7 +298,7 @@ fn no_reader_means_no_graveyard() {
 #[test]
 fn compact_drops_history_the_reader_needed() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -323,8 +323,8 @@ fn compact_drops_history_the_reader_needed() {
 #[test]
 fn compact_spares_a_reader_that_lost_nothing() {
     let db = Db::new();
-    let cold = db.table("cold", pk as fn(&Item) -> Key);
-    let hot = db.table("hot", pk as fn(&Item) -> Key);
+    let cold = db.table("cold", pk as fn(&Item) -> Key, &[]);
+    let hot = db.table("hot", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     cold.insert(&mut w, item("a", 1));
@@ -352,7 +352,7 @@ fn compact_spares_a_reader_that_lost_nothing() {
 #[test]
 fn stale_snapshot_does_not_rewind_the_tracker() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
     let mut reader = observe(&db, items);
 
     let mut w = db.write();
@@ -377,7 +377,7 @@ fn stale_snapshot_does_not_rewind_the_tracker() {
 #[test]
 fn watches_close_on_the_keys_they_cover() {
     let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key);
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     for (k, v) in [("p/1", 1), ("p/2", 2), ("q/1", 3)] {
@@ -409,4 +409,195 @@ fn watches_close_on_the_keys_they_cover() {
     assert_eq!(w.commit(), 3);
     assert!(removed.is_closed());
     assert!(over_removed.is_closed());
+
+    // A key gaining a descendant is not a change to that key's value.
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    items.insert(&mut w, item("ab", 2));
+    assert_eq!(w.commit(), 4);
+
+    let r = db.read();
+    let (_, at_a) = items.get_watch(&r, b"a");
+    let (_, at_abc) = items.get_watch(&r, b"abc");
+    let (_, under_a) = items.prefix_watch(&r, b"a");
+    let mut w = db.write();
+    items.insert(&mut w, item("abc", 3));
+    assert_eq!(w.commit(), 5);
+    assert!(!at_a.is_closed());
+    assert!(at_abc.is_closed(), "the missing key appeared");
+    assert!(under_a.is_closed(), "an entry appeared under the prefix");
+
+    // Updating and deleting the key itself do close it.
+    let r = db.read();
+    let (_, at_a) = items.get_watch(&r, b"a");
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 9));
+    assert_eq!(w.commit(), 6);
+    assert!(at_a.is_closed());
+
+    let r = db.read();
+    let (_, at_a) = items.get_watch(&r, b"a");
+    let (_, at_ab) = items.get_watch(&r, b"ab");
+    let mut w = db.write();
+    items.delete(&mut w, b"a");
+    assert_eq!(w.commit(), 7);
+    assert!(at_a.is_closed());
+    assert!(!at_ab.is_closed());
+}
+
+/// A watch registered before a commit still completes after it: the cell is
+/// closed, not dropped, so nothing is missed between registering and awaiting.
+#[tokio::test]
+async fn awaiting_a_closed_watch_returns_at_once() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let before = db.read();
+    let (_, mut taken_before) = items.get_watch(&before, b"a");
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 2));
+    assert_eq!(w.commit(), 2);
+
+    taken_before.changed().await;
+    // The same cell, subscribed to after the commit that closed it.
+    let (_, mut taken_after) = items.get_watch(&before, b"a");
+    taken_after.changed().await;
+
+    // On the new snapshot the key has an open watch again.
+    let (_, fresh) = items.get_watch(&db.read(), b"a");
+    assert!(!fresh.is_closed());
+}
+
+#[tokio::test]
+async fn a_parked_task_wakes_on_a_commit_under_its_prefix() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("p/1", 1));
+    assert_eq!(w.commit(), 1);
+
+    let r = db.read();
+    let (_, mut watch) = items.prefix_watch(&r, b"p/");
+    let waiter = tokio::spawn(async move {
+        watch.changed().await;
+    });
+    // Let the task reach the await before anything is committed.
+    tokio::task::yield_now().await;
+
+    let mut w = db.write();
+    items.insert(&mut w, item("p/2", 2));
+    assert_eq!(w.commit(), 2);
+
+    waiter.await.unwrap();
+}
+
+// ------------------------------------------------------------ secondary index
+
+#[derive(Debug)]
+struct Row {
+    key: &'static str,
+    tenants: &'static [&'static str],
+}
+
+fn row_pk(r: &Row) -> Key {
+    r.key.as_bytes().into()
+}
+
+fn row_tenants(r: &Row) -> Vec<Key> {
+    r.tenants.iter().map(|t| t.as_bytes().into()).collect()
+}
+
+const BY_TENANT: Index<Row> = Index {
+    name: "tenant",
+    keys: row_tenants,
+};
+
+fn row(key: &'static str, tenants: &'static [&'static str]) -> Row {
+    Row { key, tenants }
+}
+
+/// The primary keys listed under `tenant`.
+fn by_tenant(db: &Db, rows: Table<Row>, tenant: &str) -> Vec<String> {
+    rows.by_index(&db.read(), "tenant", tenant.as_bytes())
+        .map(|(k, _, _)| String::from_utf8(k).unwrap())
+        .collect()
+}
+
+#[test]
+fn an_index_follows_the_values_it_covers() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    rows.insert(&mut w, row("r2", &["a"]));
+    rows.insert(&mut w, row("r3", &["ab"]));
+    rows.insert(&mut w, row("r4", &["a", "b"]));
+    rows.insert(&mut w, row("r5", &[]));
+    assert_eq!(w.commit(), 1);
+
+    // "a" and "ab" are different keys, not a prefix of one another.
+    assert_eq!(by_tenant(&db, rows, "a"), ["r1", "r2", "r4"]);
+    assert_eq!(by_tenant(&db, rows, "ab"), ["r3"]);
+    // A value under two keys is listed under both; one under none is nowhere.
+    assert_eq!(by_tenant(&db, rows, "b"), ["r4"]);
+    assert!(by_tenant(&db, rows, "none").is_empty());
+
+    // An update moves the entry to its new tenant.
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["b"]));
+    assert_eq!(w.commit(), 2);
+    assert_eq!(by_tenant(&db, rows, "a"), ["r2", "r4"]);
+    assert_eq!(by_tenant(&db, rows, "b"), ["r1", "r4"]);
+
+    // A delete drops every entry of the value.
+    let mut w = db.write();
+    rows.delete(&mut w, b"r4");
+    assert_eq!(w.commit(), 3);
+    assert_eq!(by_tenant(&db, rows, "a"), ["r2"]);
+    assert_eq!(by_tenant(&db, rows, "b"), ["r1"]);
+
+    // The rows come back resolved through the primary tree.
+    let r = db.read();
+    let listed: Vec<_> = rows
+        .by_index(&r, "tenant", b"a")
+        .map(|(_, v, rev)| (v.key, rev))
+        .collect();
+    assert_eq!(listed, [("r2", 1)]);
+}
+
+#[test]
+fn an_index_watch_covers_one_index_key() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    rows.insert(&mut w, row("r9", &["b"]));
+    assert_eq!(w.commit(), 1);
+
+    let r = db.read();
+    let (_, watched) = rows.by_index_watch(&r, "tenant", b"a");
+    let (_, elsewhere) = rows.by_index_watch(&r, "tenant", b"b");
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r2", &["a"]));
+    assert_eq!(w.commit(), 2);
+
+    assert!(watched.is_closed());
+    assert!(!elsewhere.is_closed());
+}
+
+#[test]
+#[should_panic(expected = "table rows has no index colour")]
+fn an_unknown_index_is_a_programming_error() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+    let _ = rows.by_index(&db.read(), "colour", b"a").count();
 }
