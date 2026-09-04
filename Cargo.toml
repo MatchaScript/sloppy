@@ -1,0 +1,17 @@
+[package]
+name = "sloppy"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+description = "In-memory keyspace with snapshot reads, revision-indexed changes, and watches"
+
+[dependencies]
+tokio = { version = "1.47.1", features = ["sync"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
