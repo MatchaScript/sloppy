@@ -9,6 +9,7 @@
 use std::array;
 use std::cmp::Ordering;
 use std::iter;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::watch::{Cell, Closed, Closes, Watch};
@@ -16,11 +17,48 @@ use crate::watch::{Cell, Closed, Closes, Watch};
 /// Identifies the transaction that built a node. `0` is "no transaction".
 type TxnId = u64;
 
+/// How much prefix fits in a node. The heap variant is a 16-byte fat pointer
+/// beside a tag, so everything up to 22 bytes rides along for free.
+const INLINE: usize = 22;
+
+/// One node's compressed prefix, kept in the node while it fits, which for real
+/// keys is nearly always. A descent then compares the prefix without following
+/// a pointer out of the node.
+#[derive(Clone)]
+enum Prefix {
+    Inline { len: u8, bytes: [u8; INLINE] },
+    Heap(Box<[u8]>),
+}
+
+impl Prefix {
+    fn new(prefix: &[u8]) -> Self {
+        match u8::try_from(prefix.len()) {
+            Ok(len) if prefix.len() <= INLINE => {
+                let mut bytes = [0; INLINE];
+                bytes[..prefix.len()].copy_from_slice(prefix);
+                Self::Inline { len, bytes }
+            }
+            _ => Self::Heap(prefix.into()),
+        }
+    }
+}
+
+impl Deref for Prefix {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Heap(prefix) => prefix,
+        }
+    }
+}
+
 // ponytail: four node kinds, and nothing below them - no SIMD key compare, no
 // separate leaf node. The kind follows from the child count, so a path copy
 // picks it and growth and shrink need no code of their own.
 struct Node<V> {
-    prefix: Box<[u8]>,
+    prefix: Prefix,
     value: Option<Arc<V>>,
     children: Children<V>,
     /// Closed by every commit that rebuilds this node, so it covers the whole
@@ -38,7 +76,7 @@ impl<V> Node<V> {
     /// The value is new here, so its cell starts fresh.
     fn new(prefix: &[u8], value: Option<Arc<V>>, children: Children<V>, txn: TxnId) -> Arc<Self> {
         Arc::new(Self {
-            prefix: prefix.into(),
+            prefix: Prefix::new(prefix),
             value,
             children,
             subtree: Cell::default(),
@@ -905,7 +943,7 @@ fn insert<V: 'static>(
         // the tail of a split, and a new node takes its place above.
         let tail = {
             let n = Node::own(node, w);
-            n.prefix = n.prefix[common..].into();
+            n.prefix = Prefix::new(&n.prefix[common..]);
             node.clone()
         };
         *node = if common == key.len() {
@@ -990,6 +1028,30 @@ fn shrink<V: 'static>(node: &mut Arc<Node<V>>, is_root: bool, w: &mut Writing) -
     // The parent goes away with the assignment, which leaves the child
     // unshared, so `own` mutates it in place when this transaction built it.
     *node = only;
-    Node::own(node, w).prefix = merged.into();
+    Node::own(node, w).prefix = Prefix::new(&merged);
     false
+}
+
+#[cfg(test)]
+mod layout {
+    use super::{Cell, Children, Node, Prefix};
+
+    /// `cargo test -- --nocapture node_layout` prints the sizes this file is
+    /// laid out around.
+    #[test]
+    fn node_layout() {
+        println!(
+            "Node<u64> {}, Prefix {}, Children<u64> {}, Cell {}",
+            size_of::<Node<u64>>(),
+            size_of::<Prefix>(),
+            size_of::<Children<u64>>(),
+            size_of::<Cell>(),
+        );
+        assert_eq!(
+            size_of::<Prefix>(),
+            24,
+            "the inline prefix should fill the heap variant, no more"
+        );
+        assert!(size_of::<Node<u64>>() <= 120, "the node grew a word");
+    }
 }
