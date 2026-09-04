@@ -227,3 +227,131 @@ fn one_node_grows_and_shrinks_through_every_kind() {
     }
     assert_eq!(tree.len(), 2, "the prefix and its last child");
 }
+
+/// A cell has no channel until somebody watches it, so a commit can replace a
+/// node before any watch exists. The reader that subscribes afterwards must
+/// still be told, because no later commit will close that cell for it.
+#[tokio::test]
+async fn a_watch_taken_after_the_change_is_already_closed() {
+    let mut txn = Tree::new().txn();
+    txn.insert(b"a", 1);
+    txn.insert(b"b", 2);
+    let t0 = txn.commit_and_notify();
+
+    // Nobody watched anything before this commit.
+    let mut txn = t0.txn();
+    txn.insert(b"a", 11);
+    let t1 = txn.commit_and_notify();
+
+    let (value, mut late) = t0.get(b"a");
+    assert_eq!(
+        value.map(|v| **v),
+        Some(1),
+        "the old snapshot still reads 1"
+    );
+    assert!(late.is_closed());
+    late.changed().await;
+
+    // The key nobody wrote is untouched, on either snapshot.
+    let (_, elsewhere) = t0.get(b"b");
+    assert!(!elsewhere.is_closed());
+    let (_, fresh) = t1.get(b"a");
+    assert!(!fresh.is_closed());
+}
+
+/// One transaction over overlapping keys must land where the same operations
+/// applied one commit at a time land, and must leave an older snapshot alone.
+#[test]
+fn a_batched_txn_matches_separate_txns() {
+    let mut txn = Tree::new().txn();
+    for key in [b"aa".as_slice(), b"ab", b"b"] {
+        txn.insert(key, 0);
+    }
+    let base = txn.commit_and_notify();
+    let before = base.clone();
+
+    // Insert, update and delete, over keys that split, merge and split again.
+    let ops: [(&[u8], Option<u64>); 8] = [
+        (b"aa", Some(1)),
+        (b"aac", Some(2)),
+        (b"aa", Some(3)),
+        (b"ab", None),
+        (b"aac", None),
+        (b"abc", Some(4)),
+        (b"b", None),
+        (b"aa", None),
+    ];
+
+    let mut txn = base.txn();
+    for (key, value) in ops {
+        match value {
+            Some(v) => drop(txn.insert(key, v)),
+            None => drop(txn.delete(key)),
+        }
+    }
+    let batched = txn.commit_and_notify();
+    batched.assert_invariants();
+
+    let mut separate = base.clone();
+    for (key, value) in ops {
+        let mut txn = separate.txn();
+        match value {
+            Some(v) => drop(txn.insert(key, v)),
+            None => drop(txn.delete(key)),
+        }
+        separate = txn.commit_and_notify();
+    }
+
+    assert_eq!(entries(&batched), entries(&separate));
+    assert_eq!(batched.len(), separate.len());
+
+    // The snapshot taken before the batch still reads as it did.
+    assert_eq!(
+        entries(&before),
+        vec![(b"aa".to_vec(), 0), (b"ab".to_vec(), 0), (b"b".to_vec(), 0)]
+    );
+    assert_eq!(before.len(), 3);
+    before.assert_invariants();
+}
+
+/// `Cell::watch` and the commit that closes the cell must not miss each other.
+/// Both go through the cell's lock, so whichever runs second sees the work of
+/// the first and a watch handed out around a closing commit is complete once
+/// both have returned. The two-atomic version this replaced could let each side
+/// read the other's stale value on a weakly ordered machine, leaving a watch on
+/// a node already out of the tree that no later commit would ever close.
+#[test]
+fn a_watch_racing_the_commit_that_closes_it_still_closes() {
+    use std::sync::{Arc, Barrier};
+
+    for _ in 0..2000 {
+        let mut txn = Tree::new().txn();
+        txn.insert(b"a", 1);
+        let t0 = Arc::new(txn.commit_and_notify());
+        let gate = Arc::new(Barrier::new(2));
+
+        let reader = {
+            let (t0, gate) = (t0.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                t0.get(b"a").1
+            })
+        };
+        let writer = {
+            let (t0, gate) = (t0.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                let mut txn = t0.txn();
+                txn.insert(b"a", 2);
+                drop(txn.commit_and_notify());
+            })
+        };
+
+        writer.join().unwrap();
+        let watch = reader.join().unwrap();
+        assert!(
+            watch.is_closed(),
+            "the commit closed the cell this watch was taken on"
+        );
+    }
+}

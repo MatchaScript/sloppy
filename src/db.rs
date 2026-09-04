@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use crate::tree::{self, Tree};
-use crate::watch::{Watch, WatchCell};
+use crate::watch::{Closed, Watch};
 
 pub type Revision = u64;
 pub type Key = Box<[u8]>;
@@ -75,6 +75,13 @@ fn index_prefix(index_key: &[u8]) -> Vec<u8> {
     k.extend_from_slice(&len.to_be_bytes());
     k.extend_from_slice(index_key);
     k
+}
+
+/// One value's index keys, ready for `binary_search`.
+fn sorted(mut keys: Vec<Key>) -> Vec<Key> {
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// Key of an index entry: the search prefix, then the primary key, which keeps
@@ -181,8 +188,9 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
             revision: self.revision,
             primary: self.primary.clone(),
             rev_index: self.rev_index.clone(),
-            // Nothing outside this module watches the graveyard, so its cells
-            // are closed here rather than after the root swap.
+            // Nobody takes a watch on the graveyard - this module reads it
+            // with `value` - so its cells are closed here rather than after
+            // the root swap.
             graveyard: graveyard.commit_and_notify(),
             graveyard_rev: graveyard_rev.commit_and_notify(),
             indexes: self.indexes.clone(),
@@ -380,7 +388,8 @@ impl<V: Send + Sync + 'static> Table<V> {
     /// If the table was not registered in this `Db`.
     #[must_use]
     pub fn get<'a>(&self, txn: &'a ReadTxn, key: &[u8]) -> Option<(&'a V, Revision)> {
-        self.get_watch(txn, key).0
+        let object = self.entry(&txn.0).primary.value(key)?;
+        Some((object.value.as_ref(), object.revision))
     }
 
     /// # Panics
@@ -489,13 +498,10 @@ impl<V: Send + Sync + 'static> Table<V> {
             .position(|i| i.name == index)
             .unwrap_or_else(|| panic!("table {} has no index {index}", self.name));
         let (hits, watch) = entry.indexes[pos].prefix(&index_prefix(key));
-        // ponytail: resolving a hit builds and drops one `Watch`. Give the tree
-        // a plain lookup if index scans ever show up in a measurement.
         let rows = hits.map(move |(_, primary)| {
             let object = entry
                 .primary
-                .get(primary)
-                .0
+                .value(primary)
                 .expect("index disagrees with the primary tree");
             (primary.to_vec(), object.value.as_ref(), object.revision)
         });
@@ -585,13 +591,19 @@ impl<V: Send + Sync + 'static> Table<V> {
         };
         let old = pending.primary.insert(&key, object);
         for (tree, def) in pending.indexes.iter_mut().zip(&pending.index_defs) {
-            if let Some(old) = &old {
-                for k in (def.keys)(&old.value) {
-                    tree.delete(&index_entry(&k, &key));
-                }
+            // Only the difference of the two key sets touches the tree, so an
+            // update that keeps a value listed under the same index key leaves
+            // that entry, and the watch over it, alone.
+            let was = old
+                .as_ref()
+                .map(|old| sorted((def.keys)(&old.value)))
+                .unwrap_or_default();
+            let is = sorted((def.keys)(&value));
+            for k in was.iter().filter(|k| is.binary_search(k).is_err()) {
+                tree.delete(&index_entry(k, &key));
             }
-            for k in (def.keys)(&value) {
-                tree.insert(&index_entry(&k, &key), key.clone());
+            for k in is.iter().filter(|k| was.binary_search(k).is_err()) {
+                tree.insert(&index_entry(k, &key), key.clone());
             }
         }
         if let Some(old) = &old {
@@ -676,21 +688,13 @@ struct Pending<V> {
 trait AnyPending {
     /// Builds the new table entry. `closed` collects the cells of the primary
     /// tree, which the caller closes once the new root is in place.
-    fn install(
-        self: Box<Self>,
-        revision: Revision,
-        closed: &mut Vec<WatchCell>,
-    ) -> Arc<dyn AnyTable>;
+    fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable>;
 
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
-    fn install(
-        self: Box<Self>,
-        revision: Revision,
-        closed: &mut Vec<WatchCell>,
-    ) -> Arc<dyn AnyTable> {
+    fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable> {
         let this = *self;
         let revision = if this.written {
             revision
@@ -702,21 +706,22 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             tracker.store(revision, Ordering::Relaxed);
             trackers.push(Arc::downgrade(tracker));
         }
-        let (primary, mut cells) = this.primary.commit();
-        closed.append(&mut cells);
+        let (primary, cells) = this.primary.commit();
+        closed.absorb(cells);
         let indexes = this
             .indexes
             .into_iter()
             .map(|txn| {
-                let (tree, mut cells) = txn.commit();
-                closed.append(&mut cells);
+                let (tree, cells) = txn.commit();
+                closed.absorb(cells);
                 tree
             })
             .collect();
         Arc::new(TableEntry {
             revision,
             primary,
-            // The index trees carry no watch anyone can hold.
+            // Nobody takes a watch on these three; the secondary indexes
+            // above, which `by_index_watch` hands out, close after the swap.
             rev_index: this.rev_index.commit_and_notify(),
             graveyard: this.graveyard.commit_and_notify(),
             graveyard_rev: this.graveyard_rev.commit_and_notify(),
@@ -762,7 +767,7 @@ impl WriteTxn<'_> {
             return root.revision;
         }
         let revision = root.revision + Revision::from(dirty);
-        let mut closed = Vec::new();
+        let mut closed = Closed::default();
         for (pos, table) in pending.into_iter().enumerate() {
             if let Some(table) = table {
                 root.tables[pos] = table.install(revision, &mut closed);
@@ -780,9 +785,7 @@ impl WriteTxn<'_> {
 
         let snapshot = Arc::new(root);
         *db.root.write().unwrap_or_else(PoisonError::into_inner) = snapshot.clone();
-        for cell in closed {
-            cell.send_replace(true);
-        }
+        closed.close();
         if dirty {
             let txn = ReadTxn(snapshot);
             lock(&db.hook)(revision, &txn);
@@ -899,8 +902,7 @@ impl<V> Iterator for Changes<'_, V> {
         }
         .expect("peeked");
         let object = tree
-            .get(key)
-            .0
+            .value(key)
             .expect("revision index disagrees with its tree");
         Some(Change {
             key: (**key).clone(),

@@ -2,65 +2,134 @@
 //!
 //! A write path-copies: every node from the root down to the change is rebuilt,
 //! everything else stays shared through `Arc`. The full key of a node is the
-//! concatenation of the prefixes on the path from the root.
+//! concatenation of the prefixes on the path from the root. A node this
+//! transaction already rebuilt is mutated in place instead, which is what the
+//! `txn` stamp is for.
 
 use std::array;
 use std::cmp::Ordering;
 use std::iter;
+use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::watch::{Watch, WatchCell, cell};
+use crate::watch::{Cell, Closed, Closes, Watch};
+
+/// Identifies the transaction that built a node. `0` is "no transaction".
+type TxnId = u64;
+
+/// How much prefix fits in a node. The heap variant is a 16-byte fat pointer
+/// beside a tag, so everything up to 22 bytes rides along for free.
+const INLINE: usize = 22;
+
+/// One node's compressed prefix, kept in the node while it fits, which for real
+/// keys is nearly always. A descent then compares the prefix without following
+/// a pointer out of the node.
+#[derive(Clone)]
+enum Prefix {
+    Inline { len: u8, bytes: [u8; INLINE] },
+    Heap(Box<[u8]>),
+}
+
+impl Prefix {
+    fn new(prefix: &[u8]) -> Self {
+        match u8::try_from(prefix.len()) {
+            Ok(len) if prefix.len() <= INLINE => {
+                let mut bytes = [0; INLINE];
+                bytes[..prefix.len()].copy_from_slice(prefix);
+                Self::Inline { len, bytes }
+            }
+            _ => Self::Heap(prefix.into()),
+        }
+    }
+}
+
+impl Deref for Prefix {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Heap(prefix) => prefix,
+        }
+    }
+}
 
 // ponytail: four node kinds, and nothing below them - no SIMD key compare, no
 // separate leaf node. The kind follows from the child count, so a path copy
 // picks it and growth and shrink need no code of their own.
 struct Node<V> {
-    prefix: Box<[u8]>,
+    prefix: Prefix,
     value: Option<Arc<V>>,
     children: Children<V>,
     /// Closed by every commit that rebuilds this node, so it covers the whole
-    /// subtree.
-    watch: WatchCell,
-    /// Closed only by a commit that writes or removes this node's own value.
-    value_watch: WatchCell,
+    /// subtree. It sits in the node, and goes with it.
+    subtree: Cell,
+    /// Closed only by a commit that writes or removes this node's own value, so
+    /// it outlives the node and is shared by every copy that keeps the value.
+    value_cell: Arc<Cell>,
+    /// The transaction that created this node. While that transaction runs, the
+    /// node is reachable only from its root, so it can be mutated in place.
+    txn: TxnId,
 }
 
 impl<V> Node<V> {
     /// The value is new here, so its cell starts fresh.
-    fn new(prefix: &[u8], value: Option<Arc<V>>, children: Children<V>) -> Arc<Self> {
-        Self::carrying(prefix, value, cell(), children)
-    }
-
-    /// The value comes over unchanged from another node and keeps that node's
-    /// cell, so a `Watch` taken there still tracks it.
-    fn carrying(
-        prefix: &[u8],
-        value: Option<Arc<V>>,
-        value_watch: WatchCell,
-        children: Children<V>,
-    ) -> Arc<Self> {
+    fn new(prefix: &[u8], value: Option<Arc<V>>, children: Children<V>, txn: TxnId) -> Arc<Self> {
         Arc::new(Self {
-            prefix: prefix.into(),
+            prefix: Prefix::new(prefix),
             value,
             children,
-            watch: cell(),
-            value_watch,
+            subtree: Cell::default(),
+            value_cell: Arc::default(),
+            txn,
         })
     }
 
-    /// Path copy of `self`: the value and its cell carry over.
-    fn with_children(&self, prefix: &[u8], children: Children<V>) -> Arc<Self> {
-        Self::carrying(
-            prefix,
-            self.value.clone(),
-            self.value_watch.clone(),
-            children,
-        )
+    /// Path copy: the value comes over unchanged and keeps its cell, so a
+    /// `Watch` taken on the old node still tracks it.
+    fn copy(&self, txn: TxnId) -> Arc<Self> {
+        Arc::new(Self {
+            prefix: self.prefix.clone(),
+            value: self.value.clone(),
+            children: self.children.clone(),
+            subtree: Cell::default(),
+            value_cell: self.value_cell.clone(),
+            txn,
+        })
     }
+}
 
+/// Mutation keeps a replaced node alive until the commit closes its cell, which
+/// is why these need `V` to outlive the transaction.
+impl<V: 'static> Node<V> {
+    /// The node this transaction may mutate: `*node` itself when this
+    /// transaction built it, a path copy of it otherwise.
+    ///
+    /// The subtree cell that a reader can be holding is the one of the node
+    /// that was there before this transaction started, and it is closed here,
+    /// once, when that node is copied. A node this transaction built has never
+    /// been published, so nobody can hold its cell and mutating it in place
+    /// loses no notification.
+    fn own<'a>(node: &'a mut Arc<Self>, w: &mut Writing) -> &'a mut Self {
+        if node.txn != w.id {
+            w.closed.push(node.clone());
+            *node = node.copy(w.id);
+        }
+        Arc::get_mut(node).expect("a node stamped with this transaction is not shared")
+    }
+}
+
+impl<V> Node<V> {
     /// The byte a parent files this node under.
     fn key(&self) -> u8 {
         self.prefix[0]
+    }
+}
+
+/// A replaced node closes its subtree cell, and holds it alive until then.
+impl<V> Closes for Node<V> {
+    fn close(&self) {
+        self.subtree.close();
     }
 }
 
@@ -106,6 +175,35 @@ fn key_of<V>(slot: Option<&Arc<Node<V>>>) -> u8 {
     slot.expect("occupied slot").key()
 }
 
+impl<V, const K: usize> Clone for Sorted<V, K> {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys,
+            slots: array::from_fn(|i| self.slots[i].clone()),
+            len: self.len,
+        }
+    }
+}
+
+impl<V> Clone for Node48<V> {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            slots: array::from_fn(|i| self.slots[i].clone()),
+            len: self.len,
+        }
+    }
+}
+
+impl<V> Clone for Node256<V> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: array::from_fn(|i| self.slots[i].clone()),
+            len: self.len,
+        }
+    }
+}
+
 impl<V, const K: usize> Sorted<V, K> {
     fn fill(children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
         let mut this = Self {
@@ -126,17 +224,133 @@ impl<V, const K: usize> Sorted<V, K> {
         &self.slots[..usize::from(self.len)]
     }
 
+    fn keys(&self) -> &[u8] {
+        &self.keys[..usize::from(self.len)]
+    }
+
     fn get(&self, byte: u8) -> Option<&Arc<Node<V>>> {
-        let at = self.keys[..usize::from(self.len)]
-            .iter()
-            .position(|k| *k == byte)?;
+        let at = self.keys().iter().position(|k| *k == byte)?;
         self.slots[at].as_ref()
+    }
+
+    fn get_mut(&mut self, byte: u8) -> Option<&mut Arc<Node<V>>> {
+        let at = self.keys().iter().position(|k| *k == byte)?;
+        self.slots[at].as_mut()
+    }
+
+    /// Where `byte` sits, or where it would go.
+    fn find(&self, byte: u8) -> Result<usize, usize> {
+        let at = self.keys().partition_point(|k| *k < byte);
+        if self.keys().get(at) == Some(&byte) {
+            Ok(at)
+        } else {
+            Err(at)
+        }
+    }
+
+    /// A copy with `child` filed under `byte`. There must be room for it.
+    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
+        let mut this = self.clone();
+        match this.find(byte) {
+            Ok(at) => this.slots[at] = Some(child),
+            Err(at) => {
+                let end = usize::from(this.len);
+                this.keys[at..=end].rotate_right(1);
+                this.slots[at..=end].rotate_right(1);
+                this.keys[at] = byte;
+                this.slots[at] = Some(child);
+                this.len += 1;
+            }
+        }
+        this
+    }
+
+    /// A copy without the child at slot `at`.
+    fn without(&self, at: usize) -> Self {
+        let mut this = self.clone();
+        let end = usize::from(this.len);
+        this.keys[at..end].rotate_left(1);
+        this.slots[at..end].rotate_left(1);
+        this.keys[end - 1] = 0;
+        this.slots[end - 1] = None;
+        this.len -= 1;
+        this
+    }
+}
+
+impl<V> Node48<V> {
+    /// A copy with `child` filed under `byte`. There must be room for it.
+    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
+        let mut this = self.clone();
+        match this.index[usize::from(byte)] {
+            0 => {
+                // The slots stay in key order, so the new one lands after every
+                // child below `byte` and the index entries behind it move up.
+                let at = this.index[..usize::from(byte)]
+                    .iter()
+                    .filter(|slot| **slot != 0)
+                    .count();
+                let end = usize::from(this.len);
+                this.slots[at..=end].rotate_right(1);
+                for slot in &mut this.index {
+                    if usize::from(*slot) > at {
+                        *slot += 1;
+                    }
+                }
+                this.index[usize::from(byte)] =
+                    u8::try_from(at + 1).expect("node48 holds 48 slots");
+                this.slots[at] = Some(child);
+                this.len += 1;
+            }
+            slot => this.slots[usize::from(slot - 1)] = Some(child),
+        }
+        this
+    }
+
+    /// A copy without the child at `byte`, which must be there.
+    fn without(&self, byte: u8) -> Self {
+        let mut this = self.clone();
+        let at = usize::from(this.index[usize::from(byte)] - 1);
+        let end = usize::from(this.len);
+        this.slots[at..end].rotate_left(1);
+        this.slots[end - 1] = None;
+        this.index[usize::from(byte)] = 0;
+        for slot in &mut this.index {
+            if usize::from(*slot) > at + 1 {
+                *slot -= 1;
+            }
+        }
+        this.len -= 1;
+        this
+    }
+}
+
+impl<V> Node256<V> {
+    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
+        let mut this = self.clone();
+        if this.slots[usize::from(byte)].is_none() {
+            this.len += 1;
+        }
+        this.slots[usize::from(byte)] = Some(child);
+        this
+    }
+
+    fn without(&self, byte: u8) -> Self {
+        let mut this = self.clone();
+        this.slots[usize::from(byte)] = None;
+        this.len -= 1;
+        this
     }
 }
 
 impl<V> Clone for Children<V> {
     fn clone(&self) -> Self {
-        Self::build(self.len(), self.iter().cloned())
+        match self {
+            Self::N4(s) => Self::N4(s.clone()),
+            Self::N16(s) => Self::N16(s.clone()),
+            Self::N48(n) => Self::N48(n.clone()),
+            Self::N256(n) => Self::N256(n.clone()),
+        }
     }
 }
 
@@ -201,6 +415,16 @@ impl<V> Children<V> {
         }
     }
 
+    /// How many children this kind holds before the next one takes over.
+    fn cap(&self) -> usize {
+        match self {
+            Self::N4(_) => 4,
+            Self::N16(_) => 16,
+            Self::N48(_) => 48,
+            Self::N256(_) => 256,
+        }
+    }
+
     /// The slots in ascending key order. Only `N256` has empty ones.
     fn slots(&self) -> &[Slot<V>] {
         match self {
@@ -227,6 +451,18 @@ impl<V> Children<V> {
         }
     }
 
+    fn get_mut(&mut self, byte: u8) -> Option<&mut Arc<Node<V>>> {
+        match self {
+            Self::N4(s) => s.get_mut(byte),
+            Self::N16(s) => s.get_mut(byte),
+            Self::N48(n) => match n.index[usize::from(byte)] {
+                0 => None,
+                slot => n.slots[usize::from(slot - 1)].as_mut(),
+            },
+            Self::N256(n) => n.slots[usize::from(byte)].as_mut(),
+        }
+    }
+
     /// The slots below `byte` and the slots above it. The slot at `byte`, if
     /// there is one, is in neither.
     fn split(&self, byte: u8) -> (&[Slot<V>], &[Slot<V>]) {
@@ -242,31 +478,60 @@ impl<V> Children<V> {
     }
 
     /// Adds `child` under its own key, replacing whatever sits there.
+    ///
+    /// Inside one kind this copies the arrays and shifts one position: the keys
+    /// are a memcpy and the slots one `Arc` bump per child, with no child
+    /// dereferenced. Only a count that crosses a kind boundary rebuilds.
     fn with(&self, child: Arc<Node<V>>) -> Self {
-        let len = self.len() + usize::from(self.get(child.key()).is_none());
-        let (below, above) = self.split(child.key());
-        Self::build(
-            len,
-            below
-                .iter()
-                .flatten()
-                .cloned()
-                .chain(iter::once(child))
-                .chain(above.iter().flatten().cloned()),
-        )
+        let byte = child.key();
+        if self.len() == self.cap() && self.get(byte).is_none() {
+            let (below, above) = self.split(byte);
+            return Self::build(
+                self.len() + 1,
+                below
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .chain(iter::once(child))
+                    .chain(above.iter().flatten().cloned()),
+            );
+        }
+        match self {
+            Self::N4(s) => Self::N4(s.with(byte, child)),
+            Self::N16(s) => Self::N16(Box::new(s.with(byte, child))),
+            Self::N48(n) => Self::N48(Box::new(n.with(byte, child))),
+            Self::N256(n) => Self::N256(Box::new(n.with(byte, child))),
+        }
     }
 
     /// Removes the child at `byte`, which must be there.
     fn without(&self, byte: u8) -> Self {
-        let (below, above) = self.split(byte);
-        Self::build(
-            self.len() - 1,
-            below
-                .iter()
-                .flatten()
-                .chain(above.iter().flatten())
-                .cloned(),
-        )
+        let len = self.len();
+        let demotes = match self {
+            Self::N4(_) => false,
+            Self::N16(_) => len == 5,
+            Self::N48(_) => len == 17,
+            Self::N256(_) => len == 49,
+        };
+        if demotes {
+            let (below, above) = self.split(byte);
+            return Self::build(
+                len - 1,
+                below
+                    .iter()
+                    .flatten()
+                    .chain(above.iter().flatten())
+                    .cloned(),
+            );
+        }
+        match self {
+            Self::N4(s) => Self::N4(s.without(s.find(byte).expect("the child is there"))),
+            Self::N16(s) => Self::N16(Box::new(
+                s.without(s.find(byte).expect("the child is there")),
+            )),
+            Self::N48(n) => Self::N48(Box::new(n.without(byte))),
+            Self::N256(n) => Self::N256(Box::new(n.without(byte))),
+        }
     }
 
     /// The one child, when that is all there is.
@@ -365,6 +630,8 @@ fn descend<'a, V>(root: &'a Arc<Node<V>>, key: &[u8]) -> (Option<&'a Arc<V>>, &'
 pub struct Tree<V> {
     root: Arc<Node<V>>,
     len: usize,
+    /// The transaction that produced this tree; the next one gets `last_txn + 1`.
+    last_txn: TxnId,
 }
 
 impl<V> Clone for Tree<V> {
@@ -372,6 +639,7 @@ impl<V> Clone for Tree<V> {
         Self {
             root: self.root.clone(),
             len: self.len,
+            last_txn: self.last_txn,
         }
     }
 }
@@ -386,8 +654,9 @@ impl<V> Tree<V> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root: Node::new(&[], None, Children::empty()),
+            root: Node::new(&[], None, Children::empty(), 0),
             len: 0,
+            last_txn: 0,
         }
     }
 
@@ -404,7 +673,14 @@ impl<V> Tree<V> {
     /// Fires on any change to the tree.
     #[must_use]
     pub fn root_watch(&self) -> Watch {
-        Watch::new(&self.root.watch)
+        self.root.subtree.watch()
+    }
+
+    /// The value at `key`, without watching anything: a reader that would drop
+    /// the `Watch` should not make the cell allocate a channel.
+    #[must_use]
+    pub fn value(&self, key: &[u8]) -> Option<&Arc<V>> {
+        descend(&self.root, key).0
     }
 
     /// The value at `key`, plus a watch on that value alone - or, when `key`
@@ -414,11 +690,11 @@ impl<V> Tree<V> {
     pub fn get(&self, key: &[u8]) -> (Option<&Arc<V>>, Watch) {
         let (value, node) = descend(&self.root, key);
         let watch = if value.is_some() {
-            &node.value_watch
+            node.value_cell.watch()
         } else {
-            &node.watch
+            node.subtree.watch()
         };
-        (value, Watch::new(watch))
+        (value, watch)
     }
 
     /// Every entry whose key starts with `p`, plus the watch of the node the
@@ -431,11 +707,14 @@ impl<V> Tree<V> {
         loop {
             if node.prefix.len() >= rest.len() {
                 let stack = if node.prefix.starts_with(rest) {
-                    vec![Frame { key, node }]
+                    vec![Frame {
+                        node,
+                        len: key.len(),
+                    }]
                 } else {
                     Vec::new()
                 };
-                return (Iter { stack }, Watch::new(&node.watch));
+                return (Iter { path: key, stack }, node.subtree.watch());
             }
             if !rest.starts_with(&node.prefix) {
                 break;
@@ -447,7 +726,13 @@ impl<V> Tree<V> {
                 None => break,
             }
         }
-        (Iter { stack: Vec::new() }, Watch::new(&node.watch))
+        (
+            Iter {
+                path: Vec::new(),
+                stack: Vec::new(),
+            },
+            node.subtree.watch(),
+        )
     }
 
     /// Every entry with a key `>= key`, in order. Descends along `key` and
@@ -471,14 +756,20 @@ impl<V> Tree<V> {
                 Ordering::Less => break,
                 // The whole subtree sorts above `key`.
                 Ordering::Greater => {
-                    stack.push(Frame { key: acc, node });
+                    stack.push(Frame {
+                        node,
+                        len: acc.len(),
+                    });
                     break;
                 }
                 Ordering::Equal => {}
             }
             if node.prefix.len() >= rest.len() {
                 // `key` runs out inside this node, so its whole subtree is >= key.
-                stack.push(Frame { key: acc, node });
+                stack.push(Frame {
+                    node,
+                    len: acc.len(),
+                });
                 break;
             }
             // This node's own key is a strict prefix of `key`, so it sorts below
@@ -487,8 +778,8 @@ impl<V> Tree<V> {
             rest = &rest[node.prefix.len()..];
             for child in node.children.split(rest[0]).1.iter().rev().flatten() {
                 stack.push(Frame {
-                    key: acc.clone(),
                     node: child,
+                    len: acc.len(),
                 });
             }
             match node.children.get(rest[0]) {
@@ -496,7 +787,7 @@ impl<V> Tree<V> {
                 None => break,
             }
         }
-        (Iter { stack }, self.root_watch())
+        (Iter { path: acc, stack }, self.root_watch())
     }
 
     /// Every entry, in ascending key order.
@@ -504,9 +795,10 @@ impl<V> Tree<V> {
     #[must_use]
     pub fn iter(&self) -> Iter<'_, V> {
         Iter {
+            path: Vec::new(),
             stack: vec![Frame {
-                key: Vec::new(),
                 node: &self.root,
+                len: 0,
             }],
         }
     }
@@ -516,7 +808,10 @@ impl<V> Tree<V> {
         Txn {
             root: self.root.clone(),
             len: self.len,
-            closed: Vec::new(),
+            w: Writing {
+                id: self.last_txn + 1,
+                closed: Closed::default(),
+            },
         }
     }
 
@@ -547,47 +842,55 @@ impl<V> Tree<V> {
 }
 
 struct Frame<'a, V> {
-    /// Full key of the node's parent path, without the node's own prefix.
-    key: Vec<u8>,
     node: &'a Node<V>,
+    /// Length of the walk's path buffer up to this node's parent, so the node's
+    /// own key is that much of the buffer plus its prefix.
+    len: usize,
 }
 
 /// Yields `(key, value)` in ascending byte-lexicographic order.
 pub struct Iter<'a, V> {
+    /// The key of the node the walk is at, rewound to each frame's `len`.
+    path: Vec<u8>,
     stack: Vec<Frame<'a, V>>,
 }
 
 impl<'a, V> Iterator for Iter<'a, V> {
     type Item = (Vec<u8>, &'a Arc<V>);
 
-    // ponytail: one key `Vec` built per visited node. Hand out a cursor instead
-    // if the allocations ever matter.
+    // ponytail: one key `Vec` per yielded entry, none per visited node. Hand out
+    // a borrow of the path instead if even that ever matters.
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(frame) = self.stack.pop() {
-            let mut key = frame.key;
-            key.extend_from_slice(&frame.node.prefix);
+            self.path.truncate(frame.len);
+            self.path.extend_from_slice(&frame.node.prefix);
+            let len = self.path.len();
             for child in frame.node.children.iter().rev() {
-                self.stack.push(Frame {
-                    key: key.clone(),
-                    node: child,
-                });
+                self.stack.push(Frame { node: child, len });
             }
             if let Some(value) = frame.node.value.as_ref() {
-                return Some((key, value));
+                return Some((self.path.clone(), value));
             }
         }
         None
     }
 }
 
+/// What one transaction carries down the tree: its id and the cells it owes the
+/// caller.
+struct Writing {
+    id: TxnId,
+    closed: Closed,
+}
+
 /// A batch of writes over one snapshot. Dropping it aborts.
 pub struct Txn<V> {
     root: Arc<Node<V>>,
     len: usize,
-    closed: Vec<WatchCell>,
+    w: Writing,
 }
 
-impl<V> Txn<V> {
+impl<V: 'static> Txn<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&Arc<V>> {
         descend(&self.root, key).0
@@ -595,8 +898,7 @@ impl<V> Txn<V> {
 
     /// Returns the replaced value.
     pub fn insert(&mut self, key: &[u8], value: V) -> Option<Arc<V>> {
-        let (root, old) = insert(&self.root, key, Arc::new(value), &mut self.closed);
-        self.root = root;
+        let old = insert(&mut self.root, key, Arc::new(value), &mut self.w);
         if old.is_none() {
             self.len += 1;
         }
@@ -604,158 +906,182 @@ impl<V> Txn<V> {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Option<Arc<V>> {
-        let (root, old) = delete(&self.root, key, true, &mut self.closed);
-        match (root, old) {
-            (Some(root), Some(old)) => {
-                self.root = root;
-                self.len -= 1;
-                Some(old)
-            }
-            _ => None,
-        }
+        // The descent below rebuilds as it goes, so the key is looked up first:
+        // a miss must leave the tree alone.
+        descend(&self.root, key).0?;
+        let (old, _) = delete(&mut self.root, key, true, &mut self.w);
+        self.len -= 1;
+        Some(old)
     }
 
     /// The new tree and the cells the caller must close.
     #[must_use]
-    pub fn commit(self) -> (Tree<V>, Vec<WatchCell>) {
+    pub fn commit(self) -> (Tree<V>, Closed) {
         (
             Tree {
                 root: self.root,
                 len: self.len,
+                last_txn: self.w.id,
             },
-            self.closed,
+            self.w.closed,
         )
     }
 
     #[must_use]
     pub fn commit_and_notify(self) -> Tree<V> {
         let (tree, closed) = self.commit();
-        for c in closed {
-            c.send_replace(true);
-        }
+        closed.close();
         tree
     }
 }
 
-/// Path-copies `node` with `key` (relative to `node`) set to `value`.
-fn insert<V>(
-    node: &Arc<Node<V>>,
+/// Writes `value` at `key`, taken relative to `*node`, and replaces `*node`
+/// with the node that takes its place.
+fn insert<V: 'static>(
+    node: &mut Arc<Node<V>>,
     key: &[u8],
     value: Arc<V>,
-    closed: &mut Vec<WatchCell>,
-) -> (Arc<Node<V>>, Option<Arc<V>>) {
+    w: &mut Writing,
+) -> Option<Arc<V>> {
     let common = lcp(&node.prefix, key);
-    closed.push(node.watch.clone());
 
     if common < node.prefix.len() {
-        // The key diverges inside the prefix: split, the tail keeps the subtree.
-        let tail = node.with_children(&node.prefix[common..], node.children.clone());
-        if common == key.len() {
-            return (
-                Node::new(&key[..common], Some(value), Children::one(tail)),
-                None,
-            );
-        }
-        let leaf = Node::new(&key[common..], Some(value), Children::empty());
-        return (
-            Node::new(&key[..common], None, Children::pair(tail, leaf)),
-            None,
-        );
+        // The key diverges inside the prefix: this node keeps its subtree as
+        // the tail of a split, and a new node takes its place above.
+        let tail = {
+            let n = Node::own(node, w);
+            n.prefix = Prefix::new(&n.prefix[common..]);
+            node.clone()
+        };
+        *node = if common == key.len() {
+            Node::new(&key[..common], Some(value), Children::one(tail), w.id)
+        } else {
+            let leaf = Node::new(&key[common..], Some(value), Children::empty(), w.id);
+            Node::new(&key[..common], None, Children::pair(tail, leaf), w.id)
+        };
+        return None;
     }
 
     if common == key.len() {
-        let old = node.value.clone();
         // On a valueless node this closes a cell nobody holds: `get` hands out
         // the value cell only for a key that exists, and the watch on the
-        // missing key is the subtree cell closed above.
-        closed.push(node.value_watch.clone());
-        let new = Node::new(&node.prefix, Some(value), node.children.clone());
-        return (new, old);
+        // missing key is the subtree cell that `own` closes.
+        w.closed.push(node.value_cell.clone());
+        let n = Node::own(node, w);
+        n.value_cell = Arc::default();
+        return n.value.replace(value);
     }
 
     let rest = &key[common..];
-    let (child, old) = match node.children.get(rest[0]) {
-        Some(child) => insert(child, rest, value, closed),
-        None => (Node::new(rest, Some(value), Children::empty()), None),
-    };
-    (
-        node.with_children(&node.prefix, node.children.with(child)),
-        old,
-    )
+    let n = Node::own(node, w);
+    if let Some(child) = n.children.get_mut(rest[0]) {
+        return insert(child, rest, value, w);
+    }
+    n.children = n
+        .children
+        .with(Node::new(rest, Some(value), Children::empty(), w.id));
+    None
 }
 
-/// Path-copies `node` with `key` (relative to `node`) removed. A `None` node
-/// with a `Some` value means the subtree is gone; a `None` value means `key`
-/// was absent and nothing changed.
-fn delete<V>(
-    node: &Arc<Node<V>>,
+/// Removes `key`, taken relative to `*node` and known to be there. Returns the
+/// removed value and whether the node itself is gone, which the caller answers
+/// by unlinking it.
+fn delete<V: 'static>(
+    node: &mut Arc<Node<V>>,
     key: &[u8],
     is_root: bool,
-    closed: &mut Vec<WatchCell>,
-) -> (Option<Arc<Node<V>>>, Option<Arc<V>>) {
-    if !key.starts_with(&node.prefix) {
-        return (None, None);
-    }
+    w: &mut Writing,
+) -> (Arc<V>, bool) {
     let rest = &key[node.prefix.len()..];
 
     if rest.is_empty() {
-        let Some(old) = node.value.clone() else {
-            return (None, None);
-        };
-        closed.push(node.watch.clone());
-        closed.push(node.value_watch.clone());
-        let children = node.children.clone();
-        return (
-            shrink(&node.prefix, None, children, is_root, closed),
-            Some(old),
-        );
+        w.closed.push(node.value_cell.clone());
+        let n = Node::own(node, w);
+        n.value_cell = Arc::default();
+        let old = n.value.take().expect("the key was looked up first");
+        return (old, shrink(node, is_root, w));
     }
 
-    let Some(down) = node.children.get(rest[0]) else {
-        return (None, None);
+    let byte = rest[0];
+    let (old, gone) = {
+        let n = Node::own(node, w);
+        let child = n
+            .children
+            .get_mut(byte)
+            .expect("the key was looked up first");
+        delete(child, rest, false, w)
     };
-    let (child, old) = delete(down, rest, false, closed);
-    let Some(old) = old else {
-        return (None, None);
-    };
-    closed.push(node.watch.clone());
-    let children = match child {
-        Some(child) => node.children.with(child),
-        None => node.children.without(rest[0]),
-    };
-    let value = node.value.clone().map(|v| (v, node.value_watch.clone()));
-    (
-        shrink(&node.prefix, value, children, is_root, closed),
-        Some(old),
-    )
+    if gone {
+        let n = Node::own(node, w);
+        n.children = n.children.without(byte);
+    }
+    (old, shrink(node, is_root, w))
 }
 
-/// Rebuilds a node that just lost its value or a child: a node with no value
-/// and no children is dropped, one with no value and a single child is merged
-/// into that child. The root always stays, with an empty prefix.
-fn shrink<V>(
-    prefix: &[u8],
-    value: Option<(Arc<V>, WatchCell)>,
-    children: Children<V>,
-    is_root: bool,
-    closed: &mut Vec<WatchCell>,
-) -> Option<Arc<Node<V>>> {
-    if value.is_none() && !is_root {
-        if children.len() == 0 {
-            return None;
-        }
-        if let Some(only) = children.only() {
-            closed.push(only.watch.clone());
-            let mut merged = prefix.to_vec();
-            merged.extend_from_slice(&only.prefix);
-            return Some(only.with_children(&merged, only.children.clone()));
-        }
+/// Finishes a node that just lost its value or a child: a node with no value
+/// and no children is gone, one with no value and a single child merges into
+/// that child. The root always stays, with an empty prefix.
+///
+/// Returns whether the node is gone.
+fn shrink<V: 'static>(node: &mut Arc<Node<V>>, is_root: bool, w: &mut Writing) -> bool {
+    if is_root || node.value.is_some() {
+        return false;
     }
-    let (value, watch) = value.unzip();
-    Some(Node::carrying(
-        prefix,
-        value,
-        watch.unwrap_or_else(cell),
-        children,
-    ))
+    let Some(only) = node.children.only().cloned() else {
+        return node.children.len() == 0;
+    };
+    let mut merged = node.prefix.to_vec();
+    merged.extend_from_slice(&only.prefix);
+    // The parent goes away with the assignment, which leaves the child
+    // unshared, so `own` mutates it in place when this transaction built it.
+    *node = only;
+    Node::own(node, w).prefix = Prefix::new(&merged);
+    false
+}
+
+#[cfg(test)]
+mod layout {
+    use super::{Cell, Children, Node, Prefix};
+
+    /// `cargo test -- --nocapture node_layout` prints the sizes this file is
+    /// laid out around.
+    #[test]
+    fn node_layout() {
+        println!(
+            "Node<u64> {}, Prefix {}, Children<u64> {}, Cell {}",
+            size_of::<Node<u64>>(),
+            size_of::<Prefix>(),
+            size_of::<Children<u64>>(),
+            size_of::<Cell>(),
+        );
+        assert_eq!(
+            size_of::<Prefix>(),
+            24,
+            "the inline prefix should fill the heap variant, no more"
+        );
+        assert!(size_of::<Node<u64>>() <= 120, "the node grew a word");
+    }
+}
+
+#[cfg(test)]
+mod lookup {
+    use super::{Tree, descend};
+
+    /// The read paths that drop the watch go through `value`, which must leave
+    /// the cell without a channel: one allocation per row otherwise, kept for
+    /// as long as the cell rides across node rebuilds.
+    #[test]
+    fn a_plain_lookup_allocates_no_channel() {
+        let mut txn = Tree::new().txn();
+        txn.insert(b"a", 1u64);
+        let tree = txn.commit_and_notify();
+
+        assert_eq!(tree.value(b"a").map(|v| **v), Some(1));
+        let node = descend(&tree.root, b"a").1;
+        assert!(!node.value_cell.has_channel(), "`value` watches nothing");
+
+        let (_, watch) = tree.get(b"a");
+        assert!(node.value_cell.has_channel(), "`get` hands out a watch");
+        drop(watch);
+    }
 }

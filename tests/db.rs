@@ -473,6 +473,32 @@ async fn awaiting_a_closed_watch_returns_at_once() {
     assert!(!fresh.is_closed());
 }
 
+/// The same when nobody watched the key before the commit: the cell had no
+/// channel to close, and the reader that comes late is still told.
+#[tokio::test]
+async fn a_watch_taken_after_the_commit_is_already_closed() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    items.insert(&mut w, item("b", 1));
+    assert_eq!(w.commit(), 1);
+
+    let before = db.read();
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 2));
+    assert_eq!(w.commit(), 2);
+
+    let (value, mut late) = items.get_watch(&before, b"a");
+    assert_eq!(value.unwrap().0.val, 1, "the old snapshot still reads 1");
+    assert!(late.is_closed());
+    late.changed().await;
+
+    let (_, elsewhere) = items.get_watch(&before, b"b");
+    assert!(!elsewhere.is_closed());
+}
+
 #[tokio::test]
 async fn a_parked_task_wakes_on_a_commit_under_its_prefix() {
     let db = Db::new();
@@ -630,6 +656,42 @@ fn an_index_watch_covers_one_index_key() {
 
     assert!(watched.is_closed());
     assert!(!elsewhere.is_closed());
+}
+
+/// The index tree only sees the difference of the two key sets, so a row that
+/// keeps its index key keeps its entry, and the watch over that key stays open.
+#[test]
+fn an_index_watch_ignores_an_update_that_keeps_its_key() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    assert_eq!(w.commit(), 1);
+
+    let r = db.read();
+    let (_, same_tenant) = rows.by_index_watch(&r, "tenant", b"a");
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    assert_eq!(w.commit(), 2);
+    assert_eq!(
+        rows.get(&db.read(), b"r1").unwrap().1,
+        2,
+        "the row itself was rewritten"
+    );
+    assert!(!same_tenant.is_closed());
+
+    // Changing the tenant moves the entry, which both keys see.
+    let r = db.read();
+    let (_, left) = rows.by_index_watch(&r, "tenant", b"a");
+    let (_, joined) = rows.by_index_watch(&r, "tenant", b"b");
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["b"]));
+    assert_eq!(w.commit(), 3);
+    assert!(left.is_closed());
+    assert!(joined.is_closed());
+    assert!(by_tenant(&db, rows, "a").is_empty());
+    assert_eq!(by_tenant(&db, rows, "b"), ["r1"]);
 }
 
 #[test]
