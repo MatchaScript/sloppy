@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::iter;
 use std::sync::Arc;
 
-use crate::watch::{Watch, WatchCell, cell};
+use crate::watch::{Cell, Closed, Closes, Watch};
 
 /// Identifies the transaction that built a node. `0` is "no transaction".
 type TxnId = u64;
@@ -24,10 +24,11 @@ struct Node<V> {
     value: Option<Arc<V>>,
     children: Children<V>,
     /// Closed by every commit that rebuilds this node, so it covers the whole
-    /// subtree.
-    watch: WatchCell,
-    /// Closed only by a commit that writes or removes this node's own value.
-    value_watch: WatchCell,
+    /// subtree. It sits in the node, and goes with it.
+    subtree: Cell,
+    /// Closed only by a commit that writes or removes this node's own value, so
+    /// it outlives the node and is shared by every copy that keeps the value.
+    value_cell: Arc<Cell>,
     /// The transaction that created this node. While that transaction runs, the
     /// node is reachable only from its root, so it can be mutated in place.
     txn: TxnId,
@@ -40,8 +41,8 @@ impl<V> Node<V> {
             prefix: prefix.into(),
             value,
             children,
-            watch: cell(),
-            value_watch: cell(),
+            subtree: Cell::default(),
+            value_cell: Arc::default(),
             txn,
         })
     }
@@ -53,12 +54,16 @@ impl<V> Node<V> {
             prefix: self.prefix.clone(),
             value: self.value.clone(),
             children: self.children.clone(),
-            watch: cell(),
-            value_watch: self.value_watch.clone(),
+            subtree: Cell::default(),
+            value_cell: self.value_cell.clone(),
             txn,
         })
     }
+}
 
+/// Mutation keeps a replaced node alive until the commit closes its cell, which
+/// is why these need `V` to outlive the transaction.
+impl<V: 'static> Node<V> {
     /// The node this transaction may mutate: `*node` itself when this
     /// transaction built it, a path copy of it otherwise.
     ///
@@ -69,15 +74,24 @@ impl<V> Node<V> {
     /// loses no notification.
     fn own<'a>(node: &'a mut Arc<Self>, w: &mut Writing) -> &'a mut Self {
         if node.txn != w.id {
-            w.closed.push(node.watch.clone());
+            w.closed.push(node.clone());
             *node = node.copy(w.id);
         }
         Arc::get_mut(node).expect("a node stamped with this transaction is not shared")
     }
+}
 
+impl<V> Node<V> {
     /// The byte a parent files this node under.
     fn key(&self) -> u8 {
         self.prefix[0]
+    }
+}
+
+/// A replaced node closes its subtree cell, and holds it alive until then.
+impl<V> Closes for Node<V> {
+    fn close(&self) {
+        self.subtree.close();
     }
 }
 
@@ -621,7 +635,7 @@ impl<V> Tree<V> {
     /// Fires on any change to the tree.
     #[must_use]
     pub fn root_watch(&self) -> Watch {
-        Watch::new(&self.root.watch)
+        self.root.subtree.watch()
     }
 
     /// The value at `key`, plus a watch on that value alone - or, when `key`
@@ -631,11 +645,11 @@ impl<V> Tree<V> {
     pub fn get(&self, key: &[u8]) -> (Option<&Arc<V>>, Watch) {
         let (value, node) = descend(&self.root, key);
         let watch = if value.is_some() {
-            &node.value_watch
+            node.value_cell.watch()
         } else {
-            &node.watch
+            node.subtree.watch()
         };
-        (value, Watch::new(watch))
+        (value, watch)
     }
 
     /// Every entry whose key starts with `p`, plus the watch of the node the
@@ -655,7 +669,7 @@ impl<V> Tree<V> {
                 } else {
                     Vec::new()
                 };
-                return (Iter { path: key, stack }, Watch::new(&node.watch));
+                return (Iter { path: key, stack }, node.subtree.watch());
             }
             if !rest.starts_with(&node.prefix) {
                 break;
@@ -672,7 +686,7 @@ impl<V> Tree<V> {
                 path: Vec::new(),
                 stack: Vec::new(),
             },
-            Watch::new(&node.watch),
+            node.subtree.watch(),
         )
     }
 
@@ -751,7 +765,7 @@ impl<V> Tree<V> {
             len: self.len,
             w: Writing {
                 id: self.last_txn + 1,
-                closed: Vec::new(),
+                closed: Closed::default(),
             },
         }
     }
@@ -821,7 +835,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
 /// caller.
 struct Writing {
     id: TxnId,
-    closed: Vec<WatchCell>,
+    closed: Closed,
 }
 
 /// A batch of writes over one snapshot. Dropping it aborts.
@@ -831,7 +845,7 @@ pub struct Txn<V> {
     w: Writing,
 }
 
-impl<V> Txn<V> {
+impl<V: 'static> Txn<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&Arc<V>> {
         descend(&self.root, key).0
@@ -857,7 +871,7 @@ impl<V> Txn<V> {
 
     /// The new tree and the cells the caller must close.
     #[must_use]
-    pub fn commit(self) -> (Tree<V>, Vec<WatchCell>) {
+    pub fn commit(self) -> (Tree<V>, Closed) {
         (
             Tree {
                 root: self.root,
@@ -871,16 +885,14 @@ impl<V> Txn<V> {
     #[must_use]
     pub fn commit_and_notify(self) -> Tree<V> {
         let (tree, closed) = self.commit();
-        for c in closed {
-            c.send_replace(true);
-        }
+        closed.close();
         tree
     }
 }
 
 /// Writes `value` at `key`, taken relative to `*node`, and replaces `*node`
 /// with the node that takes its place.
-fn insert<V>(
+fn insert<V: 'static>(
     node: &mut Arc<Node<V>>,
     key: &[u8],
     value: Arc<V>,
@@ -909,9 +921,9 @@ fn insert<V>(
         // On a valueless node this closes a cell nobody holds: `get` hands out
         // the value cell only for a key that exists, and the watch on the
         // missing key is the subtree cell that `own` closes.
-        w.closed.push(node.value_watch.clone());
+        w.closed.push(node.value_cell.clone());
         let n = Node::own(node, w);
-        n.value_watch = cell();
+        n.value_cell = Arc::default();
         return n.value.replace(value);
     }
 
@@ -929,7 +941,7 @@ fn insert<V>(
 /// Removes `key`, taken relative to `*node` and known to be there. Returns the
 /// removed value and whether the node itself is gone, which the caller answers
 /// by unlinking it.
-fn delete<V>(
+fn delete<V: 'static>(
     node: &mut Arc<Node<V>>,
     key: &[u8],
     is_root: bool,
@@ -938,9 +950,9 @@ fn delete<V>(
     let rest = &key[node.prefix.len()..];
 
     if rest.is_empty() {
-        w.closed.push(node.value_watch.clone());
+        w.closed.push(node.value_cell.clone());
         let n = Node::own(node, w);
-        n.value_watch = cell();
+        n.value_cell = Arc::default();
         let old = n.value.take().expect("the key was looked up first");
         return (old, shrink(node, is_root, w));
     }
@@ -966,7 +978,7 @@ fn delete<V>(
 /// that child. The root always stays, with an empty prefix.
 ///
 /// Returns whether the node is gone.
-fn shrink<V>(node: &mut Arc<Node<V>>, is_root: bool, w: &mut Writing) -> bool {
+fn shrink<V: 'static>(node: &mut Arc<Node<V>>, is_root: bool, w: &mut Writing) -> bool {
     if is_root || node.value.is_some() {
         return false;
     }

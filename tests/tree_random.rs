@@ -228,6 +228,37 @@ fn one_node_grows_and_shrinks_through_every_kind() {
     assert_eq!(tree.len(), 2, "the prefix and its last child");
 }
 
+/// A cell has no channel until somebody watches it, so a commit can replace a
+/// node before any watch exists. The reader that subscribes afterwards must
+/// still be told, because no later commit will close that cell for it.
+#[tokio::test]
+async fn a_watch_taken_after_the_change_is_already_closed() {
+    let mut txn = Tree::new().txn();
+    txn.insert(b"a", 1);
+    txn.insert(b"b", 2);
+    let t0 = txn.commit_and_notify();
+
+    // Nobody watched anything before this commit.
+    let mut txn = t0.txn();
+    txn.insert(b"a", 11);
+    let t1 = txn.commit_and_notify();
+
+    let (value, mut late) = t0.get(b"a");
+    assert_eq!(
+        value.map(|v| **v),
+        Some(1),
+        "the old snapshot still reads 1"
+    );
+    assert!(late.is_closed());
+    late.changed().await;
+
+    // The key nobody wrote is untouched, on either snapshot.
+    let (_, elsewhere) = t0.get(b"b");
+    assert!(!elsewhere.is_closed());
+    let (_, fresh) = t1.get(b"a");
+    assert!(!fresh.is_closed());
+}
+
 /// One transaction over overlapping keys must land where the same operations
 /// applied one commit at a time land, and must leave an older snapshot alone.
 #[test]

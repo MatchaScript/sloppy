@@ -473,6 +473,32 @@ async fn awaiting_a_closed_watch_returns_at_once() {
     assert!(!fresh.is_closed());
 }
 
+/// The same when nobody watched the key before the commit: the cell had no
+/// channel to close, and the reader that comes late is still told.
+#[tokio::test]
+async fn a_watch_taken_after_the_commit_is_already_closed() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    items.insert(&mut w, item("b", 1));
+    assert_eq!(w.commit(), 1);
+
+    let before = db.read();
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 2));
+    assert_eq!(w.commit(), 2);
+
+    let (value, mut late) = items.get_watch(&before, b"a");
+    assert_eq!(value.unwrap().0.val, 1, "the old snapshot still reads 1");
+    assert!(late.is_closed());
+    late.changed().await;
+
+    let (_, elsewhere) = items.get_watch(&before, b"b");
+    assert!(!elsewhere.is_closed());
+}
+
 #[tokio::test]
 async fn a_parked_task_wakes_on_a_commit_under_its_prefix() {
     let db = Db::new();

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use crate::tree::{self, Tree};
-use crate::watch::{Watch, WatchCell};
+use crate::watch::{Closed, Watch};
 
 pub type Revision = u64;
 pub type Key = Box<[u8]>;
@@ -689,21 +689,13 @@ struct Pending<V> {
 trait AnyPending {
     /// Builds the new table entry. `closed` collects the cells of the primary
     /// tree, which the caller closes once the new root is in place.
-    fn install(
-        self: Box<Self>,
-        revision: Revision,
-        closed: &mut Vec<WatchCell>,
-    ) -> Arc<dyn AnyTable>;
+    fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable>;
 
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
-    fn install(
-        self: Box<Self>,
-        revision: Revision,
-        closed: &mut Vec<WatchCell>,
-    ) -> Arc<dyn AnyTable> {
+    fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable> {
         let this = *self;
         let revision = if this.written {
             revision
@@ -715,14 +707,14 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             tracker.store(revision, Ordering::Relaxed);
             trackers.push(Arc::downgrade(tracker));
         }
-        let (primary, mut cells) = this.primary.commit();
-        closed.append(&mut cells);
+        let (primary, cells) = this.primary.commit();
+        closed.absorb(cells);
         let indexes = this
             .indexes
             .into_iter()
             .map(|txn| {
-                let (tree, mut cells) = txn.commit();
-                closed.append(&mut cells);
+                let (tree, cells) = txn.commit();
+                closed.absorb(cells);
                 tree
             })
             .collect();
@@ -775,7 +767,7 @@ impl WriteTxn<'_> {
             return root.revision;
         }
         let revision = root.revision + Revision::from(dirty);
-        let mut closed = Vec::new();
+        let mut closed = Closed::default();
         for (pos, table) in pending.into_iter().enumerate() {
             if let Some(table) = table {
                 root.tables[pos] = table.install(revision, &mut closed);
@@ -793,9 +785,7 @@ impl WriteTxn<'_> {
 
         let snapshot = Arc::new(root);
         *db.root.write().unwrap_or_else(PoisonError::into_inner) = snapshot.clone();
-        for cell in closed {
-            cell.send_replace(true);
-        }
+        closed.close();
         if dirty {
             let txn = ReadTxn(snapshot);
             lock(&db.hook)(revision, &txn);
