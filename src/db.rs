@@ -60,6 +60,9 @@ struct TableEntry<V> {
     graveyard: Tree<Object<V>>,
     graveyard_rev: Tree<Key>,
     trackers: Vec<Weak<AtomicU64>>,
+    /// Highest delete revision that [`Db::compact`] removed before every
+    /// tracker had seen it. A reader below this has lost a change.
+    lost: Revision,
     primary_key: fn(&V) -> Key,
 }
 
@@ -72,6 +75,7 @@ impl<V> TableEntry<V> {
             graveyard: Tree::new(),
             graveyard_rev: Tree::new(),
             trackers: Vec::new(),
+            lost: 0,
             primary_key,
         }
     }
@@ -103,19 +107,24 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
         }
         let pruned = trackers.len() != self.trackers.len();
         // With no reader left, everything already dead may go.
-        let bound = if trackers.is_empty() {
+        let watermark = if trackers.is_empty() {
             self.revision
         } else {
             watermark
-        }
-        .max(compacted);
+        };
+        let bound = watermark.max(compacted);
 
         let mut graveyard = self.graveyard.txn();
         let mut graveyard_rev = self.graveyard_rev.txn();
         let mut removed = 0usize;
+        let mut lost = self.lost;
         for (index_key, primary_key) in self.graveyard_rev.iter() {
-            if revision_of(&index_key) > bound {
+            let revision = revision_of(&index_key);
+            if revision > bound {
                 break;
+            }
+            if revision > watermark {
+                lost = revision;
             }
             graveyard_rev.delete(&index_key);
             graveyard.delete(primary_key);
@@ -133,6 +142,7 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
             graveyard: graveyard.commit_and_notify(),
             graveyard_rev: graveyard_rev.commit_and_notify(),
             trackers,
+            lost,
             primary_key: self.primary_key,
         }))
     }
@@ -427,6 +437,7 @@ impl<V: Send + Sync + 'static> Table<V> {
                 graveyard_rev: entry.graveyard_rev.txn(),
                 trackers: entry.trackers.clone(),
                 new_trackers: Vec::new(),
+                lost: entry.lost,
                 primary_key: entry.primary_key,
             };
             txn.pending[self.pos] = Some(Box::new(pending));
@@ -523,6 +534,7 @@ struct Pending<V> {
     graveyard_rev: tree::Txn<Key>,
     trackers: Vec<Weak<AtomicU64>>,
     new_trackers: Vec<Arc<AtomicU64>>,
+    lost: Revision,
     primary_key: fn(&V) -> Key,
 }
 
@@ -565,6 +577,7 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             graveyard: this.graveyard.commit_and_notify(),
             graveyard_rev: this.graveyard_rev.commit_and_notify(),
             trackers,
+            lost: this.lost,
             primary_key: this.primary_key,
         })
     }
@@ -684,12 +697,10 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
         txn: &'a ReadTxn,
     ) -> Result<(impl Iterator<Item = Change<V>> + use<'a, V>, Watch), Compacted> {
         let observed = self.tracker.load(Ordering::Relaxed);
-        if observed < txn.0.compacted {
-            return Err(Compacted {
-                at: txn.0.compacted,
-            });
-        }
         let entry = self.table.entry(&txn.0);
+        if observed < entry.lost {
+            return Err(Compacted { at: entry.lost });
+        }
         let from = observed.saturating_add(1).to_be_bytes();
         let changes = Changes {
             live: entry.rev_index.lower_bound(&from).peekable(),
@@ -697,7 +708,8 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
             entry,
             upper: entry.revision,
         };
-        self.tracker.store(entry.revision, Ordering::Relaxed);
+        // A stale snapshot must not rewind what a newer one already observed.
+        self.tracker.fetch_max(entry.revision, Ordering::Relaxed);
         Ok((changes, entry.primary.root_watch()))
     }
 }

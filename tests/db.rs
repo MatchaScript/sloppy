@@ -321,6 +321,60 @@ fn compact_drops_history_the_reader_needed() {
 }
 
 #[test]
+fn compact_spares_a_reader_that_lost_nothing() {
+    let db = Db::new();
+    let cold = db.table("cold", pk as fn(&Item) -> Key);
+    let hot = db.table("hot", pk as fn(&Item) -> Key);
+
+    let mut w = db.write();
+    cold.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+    let mut reader = observe(&db, cold);
+
+    for i in 0..10 {
+        let mut w = db.write();
+        hot.insert(&mut w, item("h", i));
+        w.commit();
+    }
+    // Nothing in cold's graveyard was dropped: the reader is intact.
+    db.compact(11);
+    let r = db.read();
+    assert_eq!(reader.next(&r).map(|(c, _)| c.count()).ok(), Some(0));
+
+    // A tombstone the reader has not seen is compacted away: now it has lost.
+    let mut w = db.write();
+    cold.delete(&mut w, b"a");
+    let rev = w.commit();
+    db.compact(rev);
+    assert_eq!(reader.next(&db.read()).err().map(|e| e.at), Some(rev));
+}
+
+#[test]
+fn stale_snapshot_does_not_rewind_the_tracker() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key);
+    let mut reader = observe(&db, items);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    w.commit();
+    let old = db.read();
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    w.commit();
+
+    assert_eq!(
+        reader.next(&db.read()).map(|(c, _)| c.count()).ok(),
+        Some(2)
+    );
+    assert_eq!(reader.next(&old).map(|(c, _)| c.count()).ok(), Some(0));
+    assert_eq!(
+        reader.next(&db.read()).map(|(c, _)| c.count()).ok(),
+        Some(0)
+    );
+}
+
+#[test]
 fn watches_close_on_the_keys_they_cover() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key);
