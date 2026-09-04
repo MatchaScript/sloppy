@@ -50,7 +50,8 @@ fn row<V>((key, obj): (Vec<u8>, &Arc<Object<V>>)) -> (Vec<u8>, &V, Revision) {
 /// A secondary index: a name and the index keys one value is listed under.
 ///
 /// Non-unique. A value may yield zero, one, or several keys, and several values
-/// may share a key.
+/// may share a key. `keys` must be a pure function of the value: a replaced
+/// value's entries are removed by calling it again on the old value.
 pub struct Index<V> {
     pub name: &'static str,
     pub keys: fn(&V) -> Vec<Key>,

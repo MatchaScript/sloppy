@@ -529,6 +529,44 @@ fn by_tenant(db: &Db, rows: Table<Row>, tenant: &str) -> Vec<String> {
         .collect()
 }
 
+/// The first byte of the key as a second index, so one table carries two.
+fn row_first_byte(r: &Row) -> Vec<Key> {
+    vec![r.key.as_bytes()[..1].into()]
+}
+
+#[test]
+fn two_indexes_on_one_table_stay_independent() {
+    let db = Db::new();
+    let by_first = Index {
+        name: "first",
+        keys: row_first_byte,
+    };
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT, by_first]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    rows.insert(&mut w, row("s1", &["a"]));
+    rows.insert(&mut w, row("s2", &["b"]));
+    w.commit();
+    let list = |index: &'static str, key: &str| -> Vec<String> {
+        rows.by_index(&db.read(), index, key.as_bytes())
+            .map(|(k, _, _)| String::from_utf8(k).unwrap())
+            .collect()
+    };
+    assert_eq!(list("tenant", "a"), ["r1", "s1"]);
+    assert_eq!(list("first", "s"), ["s1", "s2"]);
+
+    // Deleting a tenant's rows through one index updates the other.
+    let mut w = db.write();
+    for key in by_tenant(&db, rows, "a") {
+        rows.delete(&mut w, key.as_bytes());
+    }
+    w.commit();
+    assert!(list("tenant", "a").is_empty());
+    assert_eq!(list("first", "s"), ["s2"]);
+    assert_eq!(list("first", "r"), Vec::<String>::new());
+}
+
 #[test]
 fn an_index_follows_the_values_it_covers() {
     let db = Db::new();
