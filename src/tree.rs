@@ -648,11 +648,14 @@ impl<V> Tree<V> {
         loop {
             if node.prefix.len() >= rest.len() {
                 let stack = if node.prefix.starts_with(rest) {
-                    vec![Frame { key, node }]
+                    vec![Frame {
+                        node,
+                        len: key.len(),
+                    }]
                 } else {
                     Vec::new()
                 };
-                return (Iter { stack }, Watch::new(&node.watch));
+                return (Iter { path: key, stack }, Watch::new(&node.watch));
             }
             if !rest.starts_with(&node.prefix) {
                 break;
@@ -664,7 +667,13 @@ impl<V> Tree<V> {
                 None => break,
             }
         }
-        (Iter { stack: Vec::new() }, Watch::new(&node.watch))
+        (
+            Iter {
+                path: Vec::new(),
+                stack: Vec::new(),
+            },
+            Watch::new(&node.watch),
+        )
     }
 
     /// Every entry with a key `>= key`, in order. Descends along `key` and
@@ -688,14 +697,20 @@ impl<V> Tree<V> {
                 Ordering::Less => break,
                 // The whole subtree sorts above `key`.
                 Ordering::Greater => {
-                    stack.push(Frame { key: acc, node });
+                    stack.push(Frame {
+                        node,
+                        len: acc.len(),
+                    });
                     break;
                 }
                 Ordering::Equal => {}
             }
             if node.prefix.len() >= rest.len() {
                 // `key` runs out inside this node, so its whole subtree is >= key.
-                stack.push(Frame { key: acc, node });
+                stack.push(Frame {
+                    node,
+                    len: acc.len(),
+                });
                 break;
             }
             // This node's own key is a strict prefix of `key`, so it sorts below
@@ -704,8 +719,8 @@ impl<V> Tree<V> {
             rest = &rest[node.prefix.len()..];
             for child in node.children.split(rest[0]).1.iter().rev().flatten() {
                 stack.push(Frame {
-                    key: acc.clone(),
                     node: child,
+                    len: acc.len(),
                 });
             }
             match node.children.get(rest[0]) {
@@ -713,7 +728,7 @@ impl<V> Tree<V> {
                 None => break,
             }
         }
-        (Iter { stack }, self.root_watch())
+        (Iter { path: acc, stack }, self.root_watch())
     }
 
     /// Every entry, in ascending key order.
@@ -721,9 +736,10 @@ impl<V> Tree<V> {
     #[must_use]
     pub fn iter(&self) -> Iter<'_, V> {
         Iter {
+            path: Vec::new(),
             stack: vec![Frame {
-                key: Vec::new(),
                 node: &self.root,
+                len: 0,
             }],
         }
     }
@@ -767,33 +783,34 @@ impl<V> Tree<V> {
 }
 
 struct Frame<'a, V> {
-    /// Full key of the node's parent path, without the node's own prefix.
-    key: Vec<u8>,
     node: &'a Node<V>,
+    /// Length of the walk's path buffer up to this node's parent, so the node's
+    /// own key is that much of the buffer plus its prefix.
+    len: usize,
 }
 
 /// Yields `(key, value)` in ascending byte-lexicographic order.
 pub struct Iter<'a, V> {
+    /// The key of the node the walk is at, rewound to each frame's `len`.
+    path: Vec<u8>,
     stack: Vec<Frame<'a, V>>,
 }
 
 impl<'a, V> Iterator for Iter<'a, V> {
     type Item = (Vec<u8>, &'a Arc<V>);
 
-    // ponytail: one key `Vec` built per visited node. Hand out a cursor instead
-    // if the allocations ever matter.
+    // ponytail: one key `Vec` per yielded entry, none per visited node. Hand out
+    // a borrow of the path instead if even that ever matters.
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(frame) = self.stack.pop() {
-            let mut key = frame.key;
-            key.extend_from_slice(&frame.node.prefix);
+            self.path.truncate(frame.len);
+            self.path.extend_from_slice(&frame.node.prefix);
+            let len = self.path.len();
             for child in frame.node.children.iter().rev() {
-                self.stack.push(Frame {
-                    key: key.clone(),
-                    node: child,
-                });
+                self.stack.push(Frame { node: child, len });
             }
             if let Some(value) = frame.node.value.as_ref() {
-                return Some((key, value));
+                return Some((self.path.clone(), value));
             }
         }
         None
