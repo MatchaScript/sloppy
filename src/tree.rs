@@ -4,19 +4,20 @@
 //! everything else stays shared through `Arc`. The full key of a node is the
 //! concatenation of the prefixes on the path from the root.
 
+use std::array;
 use std::cmp::Ordering;
+use std::iter;
 use std::sync::Arc;
 
 use crate::watch::{Watch, WatchCell, cell};
 
-// ponytail: one node kind, children in a sorted Vec searched by binary search.
-// Split into node4/16/48/256 when lookup or memory shows up in a measurement.
+// ponytail: four node kinds, and nothing below them - no SIMD key compare, no
+// separate leaf node. The kind follows from the child count, so a path copy
+// picks it and growth and shrink need no code of their own.
 struct Node<V> {
     prefix: Box<[u8]>,
     value: Option<Arc<V>>,
-    /// Sorted and unique by the first byte of the child's prefix, which the
-    /// `u8` duplicates so the search does not chase the `Arc`.
-    children: Vec<(u8, Arc<Node<V>>)>,
+    children: Children<V>,
     /// Closed by every commit that rebuilds this node, so it covers the whole
     /// subtree.
     watch: WatchCell,
@@ -26,7 +27,7 @@ struct Node<V> {
 
 impl<V> Node<V> {
     /// The value is new here, so its cell starts fresh.
-    fn new(prefix: &[u8], value: Option<Arc<V>>, children: Vec<(u8, Arc<Node<V>>)>) -> Arc<Self> {
+    fn new(prefix: &[u8], value: Option<Arc<V>>, children: Children<V>) -> Arc<Self> {
         Self::carrying(prefix, value, cell(), children)
     }
 
@@ -36,7 +37,7 @@ impl<V> Node<V> {
         prefix: &[u8],
         value: Option<Arc<V>>,
         value_watch: WatchCell,
-        children: Vec<(u8, Arc<Node<V>>)>,
+        children: Children<V>,
     ) -> Arc<Self> {
         Arc::new(Self {
             prefix: prefix.into(),
@@ -48,7 +49,7 @@ impl<V> Node<V> {
     }
 
     /// Path copy of `self`: the value and its cell carry over.
-    fn with_children(&self, prefix: &[u8], children: Vec<(u8, Arc<Node<V>>)>) -> Arc<Self> {
+    fn with_children(&self, prefix: &[u8], children: Children<V>) -> Arc<Self> {
         Self::carrying(
             prefix,
             self.value.clone(),
@@ -57,10 +58,284 @@ impl<V> Node<V> {
         )
     }
 
-    fn child(&self, byte: u8) -> Result<usize, usize> {
-        self.children.binary_search_by_key(&byte, |(b, _)| *b)
+    /// The byte a parent files this node under.
+    fn key(&self) -> u8 {
+        self.prefix[0]
     }
 }
+
+// -------------------------------------------------------------- node kinds
+
+type Slot<V> = Option<Arc<Node<V>>>;
+
+/// The children of one node, in the four sizes of `StateDB`'s `part`
+/// (`part/node.go`). Every kind holds its occupied slots in ascending key
+/// order, so an in-order walk is a slice walk whatever the kind is.
+///
+/// The two large kinds are boxed, so a node with few children stays small.
+enum Children<V> {
+    N4(Sorted<V, 4>),
+    N16(Box<Sorted<V, 16>>),
+    N48(Box<Node48<V>>),
+    N256(Box<Node256<V>>),
+}
+
+/// Up to `K` children, with the keys beside the slots so a lookup does not
+/// chase the `Arc`s.
+struct Sorted<V, const K: usize> {
+    keys: [u8; K],
+    slots: [Slot<V>; K],
+    len: u8,
+}
+
+/// Sorted slots plus a key index: `0` is absent, anything else is the slot
+/// number plus one.
+struct Node48<V> {
+    index: [u8; 256],
+    slots: [Slot<V>; 48],
+    len: u8,
+}
+
+/// One slot per key byte, so the array is the index.
+struct Node256<V> {
+    slots: [Slot<V>; 256],
+    len: u16,
+}
+
+fn key_of<V>(slot: Option<&Arc<Node<V>>>) -> u8 {
+    slot.expect("occupied slot").key()
+}
+
+impl<V, const K: usize> Sorted<V, K> {
+    fn fill(children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
+        let mut this = Self {
+            keys: [0; K],
+            slots: array::from_fn(|_| None),
+            len: 0,
+        };
+        for child in children {
+            let at = usize::from(this.len);
+            this.keys[at] = child.key();
+            this.slots[at] = Some(child);
+            this.len += 1;
+        }
+        this
+    }
+
+    fn occupied(&self) -> &[Slot<V>] {
+        &self.slots[..usize::from(self.len)]
+    }
+
+    fn get(&self, byte: u8) -> Option<&Arc<Node<V>>> {
+        let at = self.keys[..usize::from(self.len)]
+            .iter()
+            .position(|k| *k == byte)?;
+        self.slots[at].as_ref()
+    }
+}
+
+impl<V> Clone for Children<V> {
+    fn clone(&self) -> Self {
+        Self::build(self.len(), self.iter().cloned())
+    }
+}
+
+impl<V> Children<V> {
+    /// Builds the kind that fits `len` children, taken in ascending key order.
+    ///
+    /// The kind follows from the count alone, so growth and shrink are one rule
+    /// read in two directions, at the boundaries `part/txn.go` uses: a node4
+    /// full at 4 promotes on the 5th child, and a node16 back down to 4 demotes.
+    fn build(len: usize, children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
+        match len {
+            0..=4 => Self::N4(Sorted::fill(children)),
+            5..=16 => Self::N16(Box::new(Sorted::fill(children))),
+            17..=48 => {
+                let mut this = Node48 {
+                    index: [0; 256],
+                    slots: array::from_fn(|_| None),
+                    len: 0,
+                };
+                for child in children {
+                    this.index[usize::from(child.key())] = this.len + 1;
+                    this.slots[usize::from(this.len)] = Some(child);
+                    this.len += 1;
+                }
+                Self::N48(Box::new(this))
+            }
+            _ => {
+                let mut this = Node256 {
+                    slots: array::from_fn(|_| None),
+                    len: 0,
+                };
+                for child in children {
+                    let at = usize::from(child.key());
+                    this.slots[at] = Some(child);
+                    this.len += 1;
+                }
+                Self::N256(Box::new(this))
+            }
+        }
+    }
+
+    fn empty() -> Self {
+        Self::build(0, iter::empty())
+    }
+
+    fn one(child: Arc<Node<V>>) -> Self {
+        Self::build(1, iter::once(child))
+    }
+
+    /// Two children, given in either order.
+    fn pair(a: Arc<Node<V>>, b: Arc<Node<V>>) -> Self {
+        let ordered = if a.key() < b.key() { [a, b] } else { [b, a] };
+        Self::build(2, ordered.into_iter())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::N4(s) => usize::from(s.len),
+            Self::N16(s) => usize::from(s.len),
+            Self::N48(n) => usize::from(n.len),
+            Self::N256(n) => usize::from(n.len),
+        }
+    }
+
+    /// The slots in ascending key order. Only `N256` has empty ones.
+    fn slots(&self) -> &[Slot<V>] {
+        match self {
+            Self::N4(s) => s.occupied(),
+            Self::N16(s) => s.occupied(),
+            Self::N48(n) => &n.slots[..usize::from(n.len)],
+            Self::N256(n) => &n.slots[..],
+        }
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Arc<Node<V>>> {
+        self.slots().iter().flatten()
+    }
+
+    fn get(&self, byte: u8) -> Option<&Arc<Node<V>>> {
+        match self {
+            Self::N4(s) => s.get(byte),
+            Self::N16(s) => s.get(byte),
+            Self::N48(n) => match n.index[usize::from(byte)] {
+                0 => None,
+                slot => n.slots[usize::from(slot - 1)].as_ref(),
+            },
+            Self::N256(n) => n.slots[usize::from(byte)].as_ref(),
+        }
+    }
+
+    /// The slots below `byte` and the slots above it. The slot at `byte`, if
+    /// there is one, is in neither.
+    fn split(&self, byte: u8) -> (&[Slot<V>], &[Slot<V>]) {
+        let at = usize::from(byte);
+        if let Self::N256(n) = self {
+            return (&n.slots[..at], &n.slots[at + 1..]);
+        }
+        let slots = self.slots();
+        let below = slots.partition_point(|s| key_of(s.as_ref()) < byte);
+        let above =
+            below + usize::from(slots.get(below).is_some_and(|s| key_of(s.as_ref()) == byte));
+        (&slots[..below], &slots[above..])
+    }
+
+    /// Adds `child` under its own key, replacing whatever sits there.
+    fn with(&self, child: Arc<Node<V>>) -> Self {
+        let len = self.len() + usize::from(self.get(child.key()).is_none());
+        let (below, above) = self.split(child.key());
+        Self::build(
+            len,
+            below
+                .iter()
+                .flatten()
+                .cloned()
+                .chain(iter::once(child))
+                .chain(above.iter().flatten().cloned()),
+        )
+    }
+
+    /// Removes the child at `byte`, which must be there.
+    fn without(&self, byte: u8) -> Self {
+        let (below, above) = self.split(byte);
+        Self::build(
+            self.len() - 1,
+            below
+                .iter()
+                .flatten()
+                .chain(above.iter().flatten())
+                .cloned(),
+        )
+    }
+
+    /// The one child, when that is all there is.
+    fn only(&self) -> Option<&Arc<Node<V>>> {
+        (self.len() == 1).then(|| self.iter().next().expect("one child"))
+    }
+
+    /// Checks that the kind matches the child count and that the lookup
+    /// structures agree with the slots. Test helper.
+    fn assert_ok(&self) {
+        let len = self.len();
+        let fits = match self {
+            Self::N4(s) => {
+                s.assert_keys();
+                len <= 4
+            }
+            Self::N16(s) => {
+                s.assert_keys();
+                (5..=16).contains(&len)
+            }
+            Self::N48(n) => {
+                let listed = n.index.iter().filter(|slot| **slot != 0).count();
+                assert_eq!(listed, len, "node48 index lists {listed} of {len} children");
+                for (byte, slot) in n.index.iter().enumerate() {
+                    if *slot == 0 {
+                        continue;
+                    }
+                    let child = n.slots[usize::from(slot - 1)]
+                        .as_ref()
+                        .expect("node48 index points at an empty slot");
+                    assert_eq!(
+                        usize::from(child.key()),
+                        byte,
+                        "node48 index points at another key"
+                    );
+                }
+                (17..=48).contains(&len)
+            }
+            Self::N256(n) => {
+                for (byte, slot) in n.slots.iter().enumerate() {
+                    if let Some(child) = slot {
+                        assert_eq!(usize::from(child.key()), byte, "node256 child out of place");
+                    }
+                }
+                (49..=256).contains(&len)
+            }
+        };
+        assert!(fits, "node kind does not match {len} children");
+        for pair in self.slots().windows(2) {
+            if let [Some(a), Some(b)] = pair {
+                assert!(a.key() < b.key(), "children not sorted and unique");
+            }
+        }
+    }
+}
+
+impl<V, const K: usize> Sorted<V, K> {
+    fn assert_keys(&self) {
+        for (key, slot) in self.keys.iter().zip(self.occupied()) {
+            assert_eq!(
+                *key,
+                key_of(slot.as_ref()),
+                "key byte disagrees with the child prefix"
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------------------- tree
 
 fn lcp(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
@@ -79,9 +354,9 @@ fn descend<'a, V>(root: &'a Arc<Node<V>>, key: &[u8]) -> (Option<&'a Arc<V>>, &'
         if rest.is_empty() {
             return (node.value.as_ref(), node);
         }
-        match node.child(rest[0]) {
-            Ok(i) => node = &node.children[i].1,
-            Err(_) => return (None, node),
+        match node.children.get(rest[0]) {
+            Some(child) => node = child,
+            None => return (None, node),
         }
     }
 }
@@ -111,7 +386,7 @@ impl<V> Tree<V> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root: Node::new(&[], None, Vec::new()),
+            root: Node::new(&[], None, Children::empty()),
             len: 0,
         }
     }
@@ -167,9 +442,9 @@ impl<V> Tree<V> {
             }
             key.extend_from_slice(&node.prefix);
             rest = &rest[node.prefix.len()..];
-            match node.child(rest[0]) {
-                Ok(i) => node = &node.children[i].1,
-                Err(_) => break,
+            match node.children.get(rest[0]) {
+                Some(child) => node = child,
+                None => break,
             }
         }
         (Iter { stack: Vec::new() }, Watch::new(&node.watch))
@@ -210,18 +485,14 @@ impl<V> Tree<V> {
             // `key` and is skipped, as are the children before `rest[0]`.
             acc.extend_from_slice(&node.prefix);
             rest = &rest[node.prefix.len()..];
-            let (down, greater) = match node.child(rest[0]) {
-                Ok(i) => (Some(&node.children[i].1), i + 1),
-                Err(i) => (None, i),
-            };
-            for (_, c) in node.children[greater..].iter().rev() {
+            for child in node.children.split(rest[0]).1.iter().rev().flatten() {
                 stack.push(Frame {
                     key: acc.clone(),
-                    node: c,
+                    node: child,
                 });
             }
-            match down {
-                Some(c) => node = c,
+            match node.children.get(rest[0]) {
+                Some(child) => node = child,
                 None => break,
             }
         }
@@ -253,8 +524,8 @@ impl<V> Tree<V> {
     ///
     /// # Panics
     ///
-    /// If a non-root node is uncompressed, or a children list is unsorted or
-    /// disagrees with the child's own prefix.
+    /// If a non-root node is uncompressed, or a node's children disagree with
+    /// its kind, its order, or its own lookup structures.
     #[doc(hidden)]
     pub fn assert_invariants(&self) {
         fn walk<V>(node: &Node<V>, root: bool) {
@@ -266,15 +537,9 @@ impl<V> Tree<V> {
                 root || node.value.is_some() || node.children.len() >= 2,
                 "node with no value and fewer than two children"
             );
-            for w in node.children.windows(2) {
-                assert!(w[0].0 < w[1].0, "children not sorted and unique");
-            }
-            for (b, c) in &node.children {
-                assert_eq!(
-                    *b, c.prefix[0],
-                    "child byte disagrees with the child prefix"
-                );
-                walk(c, false);
+            node.children.assert_ok();
+            for child in node.children.iter() {
+                walk(child, false);
             }
         }
         walk(&self.root, true);
@@ -301,10 +566,10 @@ impl<'a, V> Iterator for Iter<'a, V> {
         while let Some(frame) = self.stack.pop() {
             let mut key = frame.key;
             key.extend_from_slice(&frame.node.prefix);
-            for (_, c) in frame.node.children.iter().rev() {
+            for child in frame.node.children.iter().rev() {
                 self.stack.push(Frame {
                     key: key.clone(),
-                    node: c,
+                    node: child,
                 });
             }
             if let Some(value) = frame.node.value.as_ref() {
@@ -386,13 +651,16 @@ fn insert<V>(
         // The key diverges inside the prefix: split, the tail keeps the subtree.
         let tail = node.with_children(&node.prefix[common..], node.children.clone());
         if common == key.len() {
-            let children = vec![(tail.prefix[0], tail)];
-            return (Node::new(&key[..common], Some(value), children), None);
+            return (
+                Node::new(&key[..common], Some(value), Children::one(tail)),
+                None,
+            );
         }
-        let leaf = Node::new(&key[common..], Some(value), Vec::new());
-        let mut children = vec![(tail.prefix[0], tail), (leaf.prefix[0], leaf)];
-        children.sort_unstable_by_key(|(b, _)| *b);
-        return (Node::new(&key[..common], None, children), None);
+        let leaf = Node::new(&key[common..], Some(value), Children::empty());
+        return (
+            Node::new(&key[..common], None, Children::pair(tail, leaf)),
+            None,
+        );
     }
 
     if common == key.len() {
@@ -406,19 +674,14 @@ fn insert<V>(
     }
 
     let rest = &key[common..];
-    let mut children = node.children.clone();
-    let old = match node.child(rest[0]) {
-        Ok(i) => {
-            let (child, old) = insert(&children[i].1, rest, value, closed);
-            children[i].1 = child;
-            old
-        }
-        Err(i) => {
-            children.insert(i, (rest[0], Node::new(rest, Some(value), Vec::new())));
-            None
-        }
+    let (child, old) = match node.children.get(rest[0]) {
+        Some(child) => insert(child, rest, value, closed),
+        None => (Node::new(rest, Some(value), Children::empty()), None),
     };
-    (node.with_children(&node.prefix, children), old)
+    (
+        node.with_children(&node.prefix, node.children.with(child)),
+        old,
+    )
 }
 
 /// Path-copies `node` with `key` (relative to `node`) removed. A `None` node
@@ -448,19 +711,18 @@ fn delete<V>(
         );
     }
 
-    let Ok(i) = node.child(rest[0]) else {
+    let Some(down) = node.children.get(rest[0]) else {
         return (None, None);
     };
-    let (child, old) = delete(&node.children[i].1, rest, false, closed);
+    let (child, old) = delete(down, rest, false, closed);
     let Some(old) = old else {
         return (None, None);
     };
     closed.push(node.watch.clone());
-    let mut children = node.children.clone();
-    match child {
-        Some(c) => children[i] = (c.prefix[0], c),
-        None => drop(children.remove(i)),
-    }
+    let children = match child {
+        Some(child) => node.children.with(child),
+        None => node.children.without(rest[0]),
+    };
     let value = node.value.clone().map(|v| (v, node.value_watch.clone()));
     (
         shrink(&node.prefix, value, children, is_root, closed),
@@ -474,15 +736,15 @@ fn delete<V>(
 fn shrink<V>(
     prefix: &[u8],
     value: Option<(Arc<V>, WatchCell)>,
-    children: Vec<(u8, Arc<Node<V>>)>,
+    children: Children<V>,
     is_root: bool,
     closed: &mut Vec<WatchCell>,
 ) -> Option<Arc<Node<V>>> {
     if value.is_none() && !is_root {
-        if children.is_empty() {
+        if children.len() == 0 {
             return None;
         }
-        if let [(_, only)] = children.as_slice() {
+        if let Some(only) = children.only() {
             closed.push(only.watch.clone());
             let mut merged = prefix.to_vec();
             merged.extend_from_slice(&only.prefix);
