@@ -632,6 +632,42 @@ fn an_index_watch_covers_one_index_key() {
     assert!(!elsewhere.is_closed());
 }
 
+/// The index tree only sees the difference of the two key sets, so a row that
+/// keeps its index key keeps its entry, and the watch over that key stays open.
+#[test]
+fn an_index_watch_ignores_an_update_that_keeps_its_key() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    assert_eq!(w.commit(), 1);
+
+    let r = db.read();
+    let (_, same_tenant) = rows.by_index_watch(&r, "tenant", b"a");
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    assert_eq!(w.commit(), 2);
+    assert_eq!(
+        rows.get(&db.read(), b"r1").unwrap().1,
+        2,
+        "the row itself was rewritten"
+    );
+    assert!(!same_tenant.is_closed());
+
+    // Changing the tenant moves the entry, which both keys see.
+    let r = db.read();
+    let (_, left) = rows.by_index_watch(&r, "tenant", b"a");
+    let (_, joined) = rows.by_index_watch(&r, "tenant", b"b");
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["b"]));
+    assert_eq!(w.commit(), 3);
+    assert!(left.is_closed());
+    assert!(joined.is_closed());
+    assert!(by_tenant(&db, rows, "a").is_empty());
+    assert_eq!(by_tenant(&db, rows, "b"), ["r1"]);
+}
+
 #[test]
 #[should_panic(expected = "table rows has no index colour")]
 fn an_unknown_index_is_a_programming_error() {

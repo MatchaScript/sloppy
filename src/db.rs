@@ -77,6 +77,13 @@ fn index_prefix(index_key: &[u8]) -> Vec<u8> {
     k
 }
 
+/// One value's index keys, ready for `binary_search`.
+fn sorted(mut keys: Vec<Key>) -> Vec<Key> {
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 /// Key of an index entry: the search prefix, then the primary key, which keeps
 /// the entries of one index key apart.
 fn index_entry(index_key: &[u8], primary: &[u8]) -> Key {
@@ -585,13 +592,19 @@ impl<V: Send + Sync + 'static> Table<V> {
         };
         let old = pending.primary.insert(&key, object);
         for (tree, def) in pending.indexes.iter_mut().zip(&pending.index_defs) {
-            if let Some(old) = &old {
-                for k in (def.keys)(&old.value) {
-                    tree.delete(&index_entry(&k, &key));
-                }
+            // Only the difference of the two key sets touches the tree, so an
+            // update that keeps a value listed under the same index key leaves
+            // that entry, and the watch over it, alone.
+            let was = old
+                .as_ref()
+                .map(|old| sorted((def.keys)(&old.value)))
+                .unwrap_or_default();
+            let is = sorted((def.keys)(&value));
+            for k in was.iter().filter(|k| is.binary_search(k).is_err()) {
+                tree.delete(&index_entry(k, &key));
             }
-            for k in (def.keys)(&value) {
-                tree.insert(&index_entry(&k, &key), key.clone());
+            for k in is.iter().filter(|k| was.binary_search(k).is_err()) {
+                tree.insert(&index_entry(k, &key), key.clone());
             }
         }
         if let Some(old) = &old {
