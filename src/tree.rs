@@ -248,20 +248,17 @@ impl<V, const K: usize> Sorted<V, K> {
         }
     }
 
-    /// A copy with `child` filed under `byte`. There must be room for it.
+    /// A copy with `child` filed under `byte`, which must be absent. There
+    /// must be room for it.
     fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
         let mut this = self.clone();
-        match this.find(byte) {
-            Ok(at) => this.slots[at] = Some(child),
-            Err(at) => {
-                let end = usize::from(this.len);
-                this.keys[at..=end].rotate_right(1);
-                this.slots[at..=end].rotate_right(1);
-                this.keys[at] = byte;
-                this.slots[at] = Some(child);
-                this.len += 1;
-            }
-        }
+        let at = this.find(byte).expect_err("the byte is absent");
+        let end = usize::from(this.len);
+        this.keys[at..=end].rotate_right(1);
+        this.slots[at..=end].rotate_right(1);
+        this.keys[at] = byte;
+        this.slots[at] = Some(child);
+        this.len += 1;
         this
     }
 
@@ -279,31 +276,26 @@ impl<V, const K: usize> Sorted<V, K> {
 }
 
 impl<V> Node48<V> {
-    /// A copy with `child` filed under `byte`. There must be room for it.
+    /// A copy with `child` filed under `byte`, which must be absent. There
+    /// must be room for it.
     fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
         let mut this = self.clone();
-        match this.index[usize::from(byte)] {
-            0 => {
-                // The slots stay in key order, so the new one lands after every
-                // child below `byte` and the index entries behind it move up.
-                let at = this.index[..usize::from(byte)]
-                    .iter()
-                    .filter(|slot| **slot != 0)
-                    .count();
-                let end = usize::from(this.len);
-                this.slots[at..=end].rotate_right(1);
-                for slot in &mut this.index {
-                    if usize::from(*slot) > at {
-                        *slot += 1;
-                    }
-                }
-                this.index[usize::from(byte)] =
-                    u8::try_from(at + 1).expect("node48 holds 48 slots");
-                this.slots[at] = Some(child);
-                this.len += 1;
+        // The slots stay in key order, so the new one lands after every child
+        // below `byte` and the index entries behind it move up.
+        let at = this.index[..usize::from(byte)]
+            .iter()
+            .filter(|slot| **slot != 0)
+            .count();
+        let end = usize::from(this.len);
+        this.slots[at..=end].rotate_right(1);
+        for slot in &mut this.index {
+            if usize::from(*slot) > at {
+                *slot += 1;
             }
-            slot => this.slots[usize::from(slot - 1)] = Some(child),
         }
+        this.index[usize::from(byte)] = u8::try_from(at + 1).expect("node48 holds 48 slots");
+        this.slots[at] = Some(child);
+        this.len += 1;
         this
     }
 
@@ -326,12 +318,11 @@ impl<V> Node48<V> {
 }
 
 impl<V> Node256<V> {
+    /// A copy with `child` filed under `byte`, which must be absent.
     fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
         let mut this = self.clone();
-        if this.slots[usize::from(byte)].is_none() {
-            this.len += 1;
-        }
         this.slots[usize::from(byte)] = Some(child);
+        this.len += 1;
         this
     }
 
@@ -477,14 +468,15 @@ impl<V> Children<V> {
         (&slots[..below], &slots[above..])
     }
 
-    /// Adds `child` under its own key, replacing whatever sits there.
+    /// Adds `child` under its own key, which must be absent.
     ///
     /// Inside one kind this copies the arrays and shifts one position: the keys
     /// are a memcpy and the slots one `Arc` bump per child, with no child
     /// dereferenced. Only a count that crosses a kind boundary rebuilds.
     fn with(&self, child: Arc<Node<V>>) -> Self {
         let byte = child.key();
-        if self.len() == self.cap() && self.get(byte).is_none() {
+        debug_assert!(self.get(byte).is_none(), "the key is absent");
+        if self.len() == self.cap() {
             let (below, above) = self.split(byte);
             return Self::build(
                 self.len() + 1,
