@@ -227,3 +227,58 @@ fn one_node_grows_and_shrinks_through_every_kind() {
     }
     assert_eq!(tree.len(), 2, "the prefix and its last child");
 }
+
+/// One transaction over overlapping keys must land where the same operations
+/// applied one commit at a time land, and must leave an older snapshot alone.
+#[test]
+fn a_batched_txn_matches_separate_txns() {
+    let mut txn = Tree::new().txn();
+    for key in [b"aa".as_slice(), b"ab", b"b"] {
+        txn.insert(key, 0);
+    }
+    let base = txn.commit_and_notify();
+    let before = base.clone();
+
+    // Insert, update and delete, over keys that split, merge and split again.
+    let ops: [(&[u8], Option<u64>); 8] = [
+        (b"aa", Some(1)),
+        (b"aac", Some(2)),
+        (b"aa", Some(3)),
+        (b"ab", None),
+        (b"aac", None),
+        (b"abc", Some(4)),
+        (b"b", None),
+        (b"aa", None),
+    ];
+
+    let mut txn = base.txn();
+    for (key, value) in ops {
+        match value {
+            Some(v) => drop(txn.insert(key, v)),
+            None => drop(txn.delete(key)),
+        }
+    }
+    let batched = txn.commit_and_notify();
+    batched.assert_invariants();
+
+    let mut separate = base.clone();
+    for (key, value) in ops {
+        let mut txn = separate.txn();
+        match value {
+            Some(v) => drop(txn.insert(key, v)),
+            None => drop(txn.delete(key)),
+        }
+        separate = txn.commit_and_notify();
+    }
+
+    assert_eq!(entries(&batched), entries(&separate));
+    assert_eq!(batched.len(), separate.len());
+
+    // The snapshot taken before the batch still reads as it did.
+    assert_eq!(
+        entries(&before),
+        vec![(b"aa".to_vec(), 0), (b"ab".to_vec(), 0), (b"b".to_vec(), 0)]
+    );
+    assert_eq!(before.len(), 3);
+    before.assert_invariants();
+}
