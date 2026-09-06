@@ -129,14 +129,19 @@ impl<V> Node<V> {
 /// Dropping the last reference to a deep chain must not recurse down it: the
 /// depth is the keys' owner's to pick. Children this node held alone are
 /// unlinked here and dropped one at a time, so each of their drops is shallow.
+///
+/// A child the node shares stays in its slot: its drop is one decrement and
+/// recurses nowhere. A path copy shares all but one child of every node it
+/// rebuilds, so the old node unlinks that one and touches nothing else.
 impl<V> Drop for Node<V> {
     fn drop(&mut self) {
         let mut stack = Vec::new();
-        std::mem::replace(&mut self.children, Children::empty()).drain_into(&mut stack);
+        self.children.unlink_owned(&mut stack);
         while let Some(mut child) = stack.pop() {
-            if let Some(child) = Arc::get_mut(&mut child) {
-                std::mem::replace(&mut child.children, Children::empty()).drain_into(&mut stack);
-            }
+            Arc::get_mut(&mut child)
+                .expect("an unlinked child is held alone")
+                .children
+                .unlink_owned(&mut stack);
         }
     }
 }
@@ -441,6 +446,16 @@ impl<V> Children<V> {
         }
     }
 
+    /// The same slots, for a caller that takes children out of them.
+    fn slots_mut(&mut self) -> &mut [Slot<V>] {
+        match self {
+            Self::N4(s) => &mut s.slots[..usize::from(s.len)],
+            Self::N16(s) => &mut s.slots[..usize::from(s.len)],
+            Self::N48(n) => &mut n.slots[..usize::from(n.len)],
+            Self::N256(n) => &mut n.slots[..],
+        }
+    }
+
     fn iter(&self) -> impl DoubleEndedIterator<Item = &Arc<Node<V>>> {
         self.slots().iter().flatten()
     }
@@ -546,14 +561,27 @@ impl<V> Children<V> {
         }
     }
 
-    /// Moves every child into `out`.
-    fn drain_into(self, out: &mut Vec<Arc<Node<V>>>) {
-        match self {
-            Self::N4(s) => out.extend(s.slots.into_iter().flatten()),
-            Self::N16(s) => out.extend(s.slots.into_iter().flatten()),
-            Self::N48(n) => out.extend(n.slots.into_iter().flatten()),
-            Self::N256(n) => out.extend(n.slots.into_iter().flatten()),
-        }
+    /// Moves out every child this node holds alone, leaving the shared ones in
+    /// their slots for the field drop to decrement.
+    ///
+    /// A strong count of one is the whole test, and it is a plain load.
+    /// `Arc::get_mut` proves the same thing by locking the weak count with a
+    /// compare-exchange, which guards against a `Weak` upgrading beside it; no
+    /// `Weak<Node<V>>` is ever created (the crate downgrades an `AtomicU64`
+    /// tracker in `db.rs` and nothing else) and `Node` is private, so nothing
+    /// outside can make one either. The slots belong to a node that is being
+    /// dropped, so no other thread can reach them to clone a child. Keep the
+    /// load: turning it back into `get_mut` buys nothing and costs a
+    /// read-modify-write on every shared child.
+    ///
+    /// The kind's child count is left stale, so this belongs to `Drop`, where
+    /// nothing reads it again.
+    fn unlink_owned(&mut self, out: &mut Vec<Arc<Node<V>>>) {
+        out.extend(
+            self.slots_mut()
+                .iter_mut()
+                .filter_map(|slot| slot.take_if(|child| Arc::strong_count(child) == 1)),
+        );
     }
 
     /// The one child, when that is all there is.
