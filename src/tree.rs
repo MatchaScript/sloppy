@@ -268,89 +268,78 @@ impl<V, const K: usize> Sorted<V, K> {
         }
     }
 
-    /// A copy with `child` filed under `byte`, which must be absent. There
-    /// must be room for it.
-    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
-        let mut this = self.clone();
-        let at = this.find(byte).expect_err("the byte is absent");
-        let end = usize::from(this.len);
-        this.keys[at..=end].rotate_right(1);
-        this.slots[at..=end].rotate_right(1);
-        this.keys[at] = byte;
-        this.slots[at] = Some(child);
-        this.len += 1;
-        this
+    /// Files `child` under `byte`, which must be absent. There must be room
+    /// for it.
+    fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
+        let at = self.find(byte).expect_err("the byte is absent");
+        let end = usize::from(self.len);
+        self.keys[at..=end].rotate_right(1);
+        self.slots[at..=end].rotate_right(1);
+        self.keys[at] = byte;
+        self.slots[at] = Some(child);
+        self.len += 1;
     }
 
-    /// A copy without the child at slot `at`.
-    fn without(&self, at: usize) -> Self {
-        let mut this = self.clone();
-        let end = usize::from(this.len);
-        this.keys[at..end].rotate_left(1);
-        this.slots[at..end].rotate_left(1);
-        this.keys[end - 1] = 0;
-        this.slots[end - 1] = None;
-        this.len -= 1;
-        this
+    /// Removes the child at `byte`, which must be there.
+    fn without(&mut self, byte: u8) {
+        let at = self.find(byte).expect("the child is there");
+        let end = usize::from(self.len);
+        self.keys[at..end].rotate_left(1);
+        self.slots[at..end].rotate_left(1);
+        self.keys[end - 1] = 0;
+        self.slots[end - 1] = None;
+        self.len -= 1;
     }
 }
 
 impl<V> Node48<V> {
-    /// A copy with `child` filed under `byte`, which must be absent. There
-    /// must be room for it.
-    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
-        let mut this = self.clone();
+    /// Files `child` under `byte`, which must be absent. There must be room
+    /// for it.
+    fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
         // The slots stay in key order, so the new one lands after every child
         // below `byte` and the index entries behind it move up.
-        let at = this.index[..usize::from(byte)]
+        let at = self.index[..usize::from(byte)]
             .iter()
             .filter(|slot| **slot != 0)
             .count();
-        let end = usize::from(this.len);
-        this.slots[at..=end].rotate_right(1);
-        for slot in &mut this.index {
+        let end = usize::from(self.len);
+        self.slots[at..=end].rotate_right(1);
+        for slot in &mut self.index {
             if usize::from(*slot) > at {
                 *slot += 1;
             }
         }
-        this.index[usize::from(byte)] = u8::try_from(at + 1).expect("node48 holds 48 slots");
-        this.slots[at] = Some(child);
-        this.len += 1;
-        this
+        self.index[usize::from(byte)] = u8::try_from(at + 1).expect("node48 holds 48 slots");
+        self.slots[at] = Some(child);
+        self.len += 1;
     }
 
-    /// A copy without the child at `byte`, which must be there.
-    fn without(&self, byte: u8) -> Self {
-        let mut this = self.clone();
-        let at = usize::from(this.index[usize::from(byte)] - 1);
-        let end = usize::from(this.len);
-        this.slots[at..end].rotate_left(1);
-        this.slots[end - 1] = None;
-        this.index[usize::from(byte)] = 0;
-        for slot in &mut this.index {
+    /// Removes the child at `byte`, which must be there.
+    fn without(&mut self, byte: u8) {
+        let at = usize::from(self.index[usize::from(byte)] - 1);
+        let end = usize::from(self.len);
+        self.slots[at..end].rotate_left(1);
+        self.slots[end - 1] = None;
+        self.index[usize::from(byte)] = 0;
+        for slot in &mut self.index {
             if usize::from(*slot) > at + 1 {
                 *slot -= 1;
             }
         }
-        this.len -= 1;
-        this
+        self.len -= 1;
     }
 }
 
 impl<V> Node256<V> {
-    /// A copy with `child` filed under `byte`, which must be absent.
-    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
-        let mut this = self.clone();
-        this.slots[usize::from(byte)] = Some(child);
-        this.len += 1;
-        this
+    /// Files `child` under `byte`, which must be absent.
+    fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
+        self.slots[usize::from(byte)] = Some(child);
+        self.len += 1;
     }
 
-    fn without(&self, byte: u8) -> Self {
-        let mut this = self.clone();
-        this.slots[usize::from(byte)] = None;
-        this.len -= 1;
-        this
+    fn without(&mut self, byte: u8) {
+        self.slots[usize::from(byte)] = None;
+        self.len -= 1;
     }
 }
 
@@ -505,15 +494,16 @@ impl<V> Children<V> {
 
     /// Adds `child` under its own key, which must be absent.
     ///
-    /// Inside one kind this copies the arrays and shifts one position: the keys
-    /// are a memcpy and the slots one `Arc` bump per child, with no child
-    /// dereferenced. Only a count that crosses a kind boundary rebuilds.
-    fn with(&self, child: Arc<Node<V>>) -> Self {
+    /// Inside one kind the arrays shift one position where they sit: the keys
+    /// move by memcpy and the slots by move, so no child is dereferenced and no
+    /// `Arc` count changes. Only a count that crosses a kind boundary rebuilds,
+    /// and that one costs the `Arc` bump per child.
+    fn with(&mut self, child: Arc<Node<V>>) {
         let byte = child.key();
         debug_assert!(self.get(byte).is_none(), "the key is absent");
         if self.len() == self.cap() {
             let (below, above) = self.split(byte);
-            return Self::build(
+            *self = Self::build(
                 self.len() + 1,
                 below
                     .iter()
@@ -522,17 +512,20 @@ impl<V> Children<V> {
                     .chain(iter::once(child))
                     .chain(above.iter().flatten().cloned()),
             );
+            return;
         }
         match self {
-            Self::N4(s) => Self::N4(s.with(byte, child)),
-            Self::N16(s) => Self::N16(Box::new(s.with(byte, child))),
-            Self::N48(n) => Self::N48(Box::new(n.with(byte, child))),
-            Self::N256(n) => Self::N256(Box::new(n.with(byte, child))),
+            Self::N4(s) => s.with(byte, child),
+            Self::N16(s) => s.with(byte, child),
+            Self::N48(n) => n.with(byte, child),
+            Self::N256(n) => n.with(byte, child),
         }
     }
 
     /// Removes the child at `byte`, which must be there.
-    fn without(&self, byte: u8) -> Self {
+    ///
+    /// In place like `with`, except at the count where the kind demotes.
+    fn without(&mut self, byte: u8) {
         let len = self.len();
         let demotes = match self {
             Self::N4(_) => false,
@@ -542,7 +535,7 @@ impl<V> Children<V> {
         };
         if demotes {
             let (below, above) = self.split(byte);
-            return Self::build(
+            *self = Self::build(
                 len - 1,
                 below
                     .iter()
@@ -550,14 +543,13 @@ impl<V> Children<V> {
                     .chain(above.iter().flatten())
                     .cloned(),
             );
+            return;
         }
         match self {
-            Self::N4(s) => Self::N4(s.without(s.find(byte).expect("the child is there"))),
-            Self::N16(s) => Self::N16(Box::new(
-                s.without(s.find(byte).expect("the child is there")),
-            )),
-            Self::N48(n) => Self::N48(Box::new(n.without(byte))),
-            Self::N256(n) => Self::N256(Box::new(n.without(byte))),
+            Self::N4(s) => s.without(byte),
+            Self::N16(s) => s.without(byte),
+            Self::N48(n) => n.without(byte),
+            Self::N256(n) => n.without(byte),
         }
     }
 
@@ -1052,8 +1044,7 @@ fn insert<V: 'static>(
         // Looked up twice: the loop hands `node` on to the child's slot, which
         // a borrow held across the miss branch would not allow.
         if n.children.get(rest[0]).is_none() {
-            n.children = n
-                .children
+            n.children
                 .with(Node::new(rest, Some(value), Children::empty(), w.id));
             return None;
         }
@@ -1094,7 +1085,7 @@ fn delete<V: 'static>(root: &mut Arc<Node<V>>, key: &[u8], w: &mut Writing) -> A
         let p = Arc::get_mut(&mut parent).expect("owned on the way down");
         *p.children.slot_mut(byte).expect("taken on the way down") = Some(node);
         if gone {
-            p.children = p.children.without(byte);
+            p.children.without(byte);
         }
         node = parent;
         gone = shrink(&mut node, path.is_empty(), w);
