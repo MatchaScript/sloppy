@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use sloppy::db::{Change, ChangeIterator, Db, Index, Key, Revision, Table};
+use sloppy::db::{Change, ChangeIterator, Db, Index, Key, Revision, Table, Version};
 
 #[derive(Debug)]
 struct Item {
@@ -29,6 +29,35 @@ fn drain<I: Iterator<Item = Change<Item>>>(changes: I) -> Vec<(String, Revision,
                 c.deleted,
             )
         })
+        .collect()
+}
+
+/// The same with the value each change carries.
+fn drain_values<I: Iterator<Item = Change<Item>>>(
+    changes: I,
+) -> Vec<(String, u32, Revision, bool)> {
+    changes
+        .map(|c| {
+            (
+                String::from_utf8(c.key.to_vec()).unwrap(),
+                c.value.val,
+                c.revision,
+                c.deleted,
+            )
+        })
+        .collect()
+}
+
+/// `(revision, value, deleted)` of every version of `key`.
+fn versions(
+    items: Table<Item>,
+    txn: &sloppy::db::ReadTxn,
+    key: &[u8],
+) -> Vec<(Revision, u32, bool)> {
+    items
+        .versions(txn, key)
+        .iter()
+        .map(|v| (v.revision, v.value.val, v.deleted))
         .collect()
 }
 
@@ -197,7 +226,7 @@ fn observe(db: &Db, items: Table<Item>) -> ChangeIterator<Item> {
 }
 
 #[test]
-fn changes_report_the_last_state_of_each_key() {
+fn changes_report_one_record_per_key_and_commit() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
@@ -221,32 +250,67 @@ fn changes_report_the_last_state_of_each_key() {
 
     let r = db.read();
     let (changes, _watch) = reader.next(&r).unwrap();
-    // No update of "a": its live entry is gone, only the deletion remains.
+    // Both commits that touched "a" are there: the update and the deletion,
+    // which carries the value it removed.
     assert_eq!(
-        drain(changes),
-        vec![("b".into(), 3, false), ("a".into(), 4, true)]
+        drain_values(changes),
+        vec![
+            ("a".into(), 2, 2, false),
+            ("b".into(), 1, 3, false),
+            ("a".into(), 2, 4, true),
+        ]
     );
 
-    // Create and delete between two `next` calls: only the deletion is seen.
+    // Create in one commit and delete in the next: one record each.
     let mut w = db.write();
     items.insert(&mut w, item("c", 1));
     assert_eq!(w.commit(), 5);
-    // The reader has read up to 4, so this commit clears the graveyard.
-    assert_eq!(items.graveyard_len(&db.read()), 0);
+    // The reader has read up to 4, so this commit releases everything below.
+    assert_eq!(items.held_records(&db.read()), [5]);
     let mut w = db.write();
     items.delete(&mut w, b"c");
     assert_eq!(w.commit(), 6);
 
     let r = db.read();
     let (changes, _watch) = reader.next(&r).unwrap();
-    assert_eq!(drain(changes), vec![("c".into(), 6, true)]);
+    assert_eq!(
+        drain(changes),
+        vec![("c".into(), 5, false), ("c".into(), 6, true)]
+    );
 }
 
-/// One key written twice in one commit leaves two records, in the order they
-/// were written; written again in a later commit it leaves one, because the
-/// second write drops the record the first left.
+/// One key written twice in one commit leaves one version and one record: the
+/// second write replaces what the first left. Written again in a later commit
+/// it leaves a second version and a second record, and both reach the reader.
 #[test]
-fn a_key_written_twice_in_one_commit_leaves_both_records() {
+fn a_key_written_twice_in_one_commit_leaves_one_record() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let mut reader = observe(&db, items);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    items.insert(&mut w, item("a", 2));
+    assert_eq!(w.commit(), 1);
+    assert_eq!(items.held_records(&db.read()), [1]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 3));
+    assert_eq!(w.commit(), 2);
+
+    let r = db.read();
+    assert_eq!(items.held_records(&r), [1, 2]);
+    assert_eq!(versions(items, &r, b"a"), [(1, 2, false), (2, 3, false)]);
+    assert_eq!(
+        drain(reader.next(&r).unwrap().0),
+        vec![("a".into(), 1, false), ("a".into(), 2, false)]
+    );
+}
+
+/// Each record hands over the version its own commit left, so a key rewritten
+/// in a later commit reports both values rather than the newest twice.
+#[test]
+fn changes_carry_the_value_each_commit_left() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
     let mut reader = observe(&db, items);
@@ -261,13 +325,13 @@ fn a_key_written_twice_in_one_commit_leaves_both_records() {
     assert_eq!(w.commit(), 2);
 
     assert_eq!(
-        drain(reader.next(&db.read()).unwrap().0),
-        vec![("a".into(), 1, false), ("a".into(), 2, false)]
+        drain_values(reader.next(&db.read()).unwrap().0),
+        vec![("a".into(), 2, 1, false), ("a".into(), 3, 2, false)]
     );
 }
 
 #[test]
-fn graveyard_holds_until_every_reader_has_read() {
+fn a_deletion_is_held_until_every_reader_has_read() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
@@ -281,16 +345,19 @@ fn graveyard_holds_until_every_reader_has_read() {
     let mut w = db.write();
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 2);
-    assert_eq!(items.graveyard_len(&db.read()), 1);
-
     let r = db.read();
+    assert_eq!(items.held_records(&r), [2]);
+    // The key is gone, and the tombstone that ends its row holds the value.
+    assert!(items.get(&r, b"a").is_none());
+    assert_eq!(versions(items, &r, b"a"), [(1, 1, false), (2, 1, true)]);
+
     assert_eq!(drain(fast.next(&r).unwrap().0), vec![("a".into(), 2, true)]);
 
     // The slow reader has not seen it, so the next commit keeps it.
     let mut w = db.write();
     items.insert(&mut w, item("b", 1));
     assert_eq!(w.commit(), 3);
-    assert_eq!(items.graveyard_len(&db.read()), 1);
+    assert_eq!(items.held_records(&db.read()), [2, 3]);
 
     let r = db.read();
     assert_eq!(
@@ -300,11 +367,12 @@ fn graveyard_holds_until_every_reader_has_read() {
     let mut w = db.write();
     items.insert(&mut w, item("c", 1));
     assert_eq!(w.commit(), 4);
-    assert_eq!(items.graveyard_len(&db.read()), 0);
+    // Both readers are past the deletion, so only the newer records are left.
+    assert_eq!(items.held_records(&db.read()), [3, 4]);
 }
 
 #[test]
-fn dropping_a_reader_releases_the_graveyard() {
+fn dropping_a_reader_releases_the_deletion() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
@@ -316,19 +384,18 @@ fn dropping_a_reader_releases_the_graveyard() {
     let mut w = db.write();
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 2);
-    assert_eq!(items.graveyard_len(&db.read()), 1);
+    assert_eq!(items.held_records(&db.read()), [2]);
 
     drop(reader);
     let mut w = db.write();
     items.insert(&mut w, item("b", 1));
     assert_eq!(w.commit(), 3);
-    assert_eq!(items.graveyard_len(&db.read()), 0);
+    assert!(items.held_records(&db.read()).is_empty());
 }
 
 /// Rebuilding a table by deleting every key and writing it again leaves one
-/// record per key, not a deletion on top of it: the write takes the place of
-/// the deletion it undoes, so a reader that has stalled holds back one
-/// generation of the table rather than one per rebuild.
+/// record per key and per round, and no tombstone: the write replaces the
+/// version the deletion left and reuses its record.
 #[test]
 fn re_creating_a_key_in_the_same_commit_replaces_its_deletion() {
     let db = Db::new();
@@ -350,17 +417,40 @@ fn re_creating_a_key_in_the_same_commit_replaces_its_deletion() {
             items.insert(&mut w, item(key, round));
         }
         w.commit();
-        assert_eq!(items.graveyard_len(&db.read()), 0, "round {round}");
+
+        let r = db.read();
+        let rounds = usize::try_from(round).unwrap();
+        let round = Revision::from(round);
+        assert_eq!(
+            items
+                .versions(&r, b"a")
+                .last()
+                .map(|v| (v.revision, v.deleted)),
+            Some((round, false)),
+            "round {round} ends on the value, not the deletion"
+        );
+        assert_eq!(
+            items.held_records(&r).len(),
+            2 * (rounds - 1),
+            "round {round} left one record per key"
+        );
     }
 
     assert_eq!(
-        drain(stalled.next(&db.read()).unwrap().0),
-        vec![("a".into(), 4, false), ("b".into(), 4, false)]
+        drain_values(stalled.next(&db.read()).unwrap().0),
+        vec![
+            ("a".into(), 2, 2, false),
+            ("b".into(), 2, 2, false),
+            ("a".into(), 3, 3, false),
+            ("b".into(), 3, 3, false),
+            ("a".into(), 4, 4, false),
+            ("b".into(), 4, 4, false),
+        ]
     );
 }
 
 #[test]
-fn no_reader_means_no_graveyard() {
+fn no_reader_means_no_held_record() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
@@ -371,7 +461,150 @@ fn no_reader_means_no_graveyard() {
     items.delete(&mut w, b"a");
     w.commit();
 
-    assert_eq!(items.graveyard_len(&db.read()), 0);
+    let r = db.read();
+    assert!(items.held_records(&r).is_empty());
+    assert!(items.get(&r, b"a").is_none());
+    assert_eq!(versions(items, &r, b"a"), [(1, 1, false), (2, 1, true)]);
+}
+
+/// The versions a compaction released go when the key is next written; until
+/// then the row keeps them, so a reader below the bound still finds them.
+#[test]
+fn a_write_trims_the_versions_a_compaction_released() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    for val in 1..=3 {
+        let mut w = db.write();
+        items.insert(&mut w, item("a", val));
+        assert_eq!(w.commit(), Revision::from(val));
+    }
+    assert_eq!(
+        versions(items, &db.read(), b"a"),
+        [(1, 1, false), (2, 2, false), (3, 3, false)]
+    );
+
+    db.compact(2);
+    assert_eq!(
+        versions(items, &db.read(), b"a"),
+        [(1, 1, false), (2, 2, false), (3, 3, false)],
+        "compaction alone does not touch the row"
+    );
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 4));
+    assert_eq!(w.commit(), 4);
+    assert_eq!(
+        versions(items, &db.read(), b"a"),
+        [(3, 3, false), (4, 4, false)]
+    );
+
+    // The same over a longer row: what the write leaves is every version past
+    // the bound, the one it just wrote included.
+    for val in 5..=7 {
+        let mut w = db.write();
+        items.insert(&mut w, item("a", val));
+        assert_eq!(w.commit(), Revision::from(val));
+    }
+    db.compact(5);
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 8));
+    assert_eq!(w.commit(), 8);
+    assert_eq!(
+        versions(items, &db.read(), b"a"),
+        [(6, 6, false), (7, 7, false), (8, 8, false)]
+    );
+}
+
+/// The other half of the reclamation: a row whose deletion both bounds have
+/// passed leaves the primary tree with its versions.
+#[test]
+fn a_compaction_past_a_deletion_sweeps_the_row() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    items.insert(&mut w, item("b", 1));
+    assert_eq!(w.commit(), 1);
+    let mut w = db.write();
+    items.delete(&mut w, b"a");
+    assert_eq!(w.commit(), 2);
+    assert_eq!(
+        versions(items, &db.read(), b"a"),
+        [(1, 1, false), (2, 1, true)]
+    );
+
+    db.compact(2);
+    let r = db.read();
+    assert!(items.get(&r, b"a").is_none());
+    assert!(versions(items, &r, b"a").is_empty(), "the row went with it");
+    assert_eq!(
+        versions(items, &r, b"b"),
+        [(1, 1, false)],
+        "a live row stays"
+    );
+}
+
+/// The bound is the lower of the two: a change reader that has not seen the
+/// deletion keeps the row, however far the compaction bound has gone.
+#[test]
+fn a_reader_below_a_deletion_keeps_the_row() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let _reader = observe(&db, items);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+    let mut w = db.write();
+    items.delete(&mut w, b"a");
+    assert_eq!(w.commit(), 2);
+
+    db.compact(2);
+    assert_eq!(
+        versions(items, &db.read(), b"a"),
+        [(1, 1, false), (2, 1, true)]
+    );
+}
+
+/// The caller's revision is what the transaction writes at and what its commit
+/// leaves the database at.
+#[test]
+fn write_at_takes_the_revision_it_is_given() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write_at(10);
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 10);
+
+    let r = db.read();
+    assert_eq!(r.revision(), 10);
+    assert_eq!(
+        items.get(&r, b"a").map(|(v, rev)| (v.val, rev)),
+        Some((1, 10))
+    );
+
+    // A transaction that writes nothing leaves the revision where it was.
+    assert_eq!(db.write_at(20).commit(), 10);
+    // And `write` carries on from what is visible.
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 1));
+    assert_eq!(w.commit(), 11);
+}
+
+#[test]
+#[should_panic(expected = "is not past the visible")]
+fn write_at_rejects_a_revision_that_goes_back() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let _ = db.write_at(1);
 }
 
 #[test]
@@ -388,11 +621,11 @@ fn compact_drops_history_the_reader_needed() {
     let mut w = db.write();
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 2);
-    assert_eq!(items.graveyard_len(&db.read()), 1);
+    assert_eq!(items.held_records(&db.read()), [2]);
 
     db.compact(2);
     let r = db.read();
-    assert_eq!(items.graveyard_len(&r), 0);
+    assert!(items.held_records(&r).is_empty());
     // Compaction is not history.
     assert_eq!(r.revision(), 2);
 
@@ -415,7 +648,7 @@ fn compact_spares_a_reader_that_lost_nothing() {
         hot.insert(&mut w, item("h", i));
         w.commit();
     }
-    // Nothing in cold's graveyard was dropped: the reader is intact.
+    // None of cold's records was dropped: the reader is intact.
     db.compact(11);
     let r = db.read();
     assert_eq!(reader.next(&r).map(|(c, _)| c.count()).ok(), Some(0));
@@ -497,131 +730,6 @@ fn stale_snapshot_does_not_rewind_the_tracker() {
     );
 }
 
-#[test]
-fn watches_close_on_the_keys_they_cover() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    for (k, v) in [("p/1", 1), ("p/2", 2), ("q/1", 3)] {
-        items.insert(&mut w, item(k, v));
-    }
-    assert_eq!(w.commit(), 1);
-
-    let r = db.read();
-    let (_, touched) = items.get_watch(&r, b"p/1");
-    let (_, elsewhere) = items.get_watch(&r, b"q/1");
-    let (_, covering) = items.prefix_watch(&r, b"p/");
-    let (_, whole_table) = items.all_watch(&r);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("p/1", 9));
-    assert_eq!(w.commit(), 2);
-
-    assert!(touched.is_closed());
-    assert!(covering.is_closed());
-    assert!(whole_table.is_closed());
-    assert!(!elsewhere.is_closed());
-
-    // A delete closes the same watches an insert does.
-    let r = db.read();
-    let (_, removed) = items.get_watch(&r, b"q/1");
-    let (_, over_removed) = items.prefix_watch(&r, b"q/");
-    let mut w = db.write();
-    items.delete(&mut w, b"q/1");
-    assert_eq!(w.commit(), 3);
-    assert!(removed.is_closed());
-    assert!(over_removed.is_closed());
-
-    // A key gaining a descendant is not a change to that key's value.
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    items.insert(&mut w, item("ab", 2));
-    assert_eq!(w.commit(), 4);
-
-    let r = db.read();
-    let (_, at_a) = items.get_watch(&r, b"a");
-    let (_, at_abc) = items.get_watch(&r, b"abc");
-    let (_, under_a) = items.prefix_watch(&r, b"a");
-    let mut w = db.write();
-    items.insert(&mut w, item("abc", 3));
-    assert_eq!(w.commit(), 5);
-    assert!(!at_a.is_closed());
-    assert!(at_abc.is_closed(), "the missing key appeared");
-    assert!(under_a.is_closed(), "an entry appeared under the prefix");
-
-    // Updating and deleting the key itself do close it.
-    let r = db.read();
-    let (_, at_a) = items.get_watch(&r, b"a");
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 9));
-    assert_eq!(w.commit(), 6);
-    assert!(at_a.is_closed());
-
-    let r = db.read();
-    let (_, at_a) = items.get_watch(&r, b"a");
-    let (_, at_ab) = items.get_watch(&r, b"ab");
-    let mut w = db.write();
-    items.delete(&mut w, b"a");
-    assert_eq!(w.commit(), 7);
-    assert!(at_a.is_closed());
-    assert!(!at_ab.is_closed());
-}
-
-/// A watch registered before a commit still completes after it: the cell is
-/// closed, not dropped, so nothing is missed between registering and awaiting.
-#[tokio::test]
-async fn awaiting_a_closed_watch_returns_at_once() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let before = db.read();
-    let (_, mut taken_before) = items.get_watch(&before, b"a");
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 2));
-    assert_eq!(w.commit(), 2);
-
-    taken_before.changed().await;
-    // The same cell, subscribed to after the commit that closed it.
-    let (_, mut taken_after) = items.get_watch(&before, b"a");
-    taken_after.changed().await;
-
-    // On the new snapshot the key has an open watch again.
-    let (_, fresh) = items.get_watch(&db.read(), b"a");
-    assert!(!fresh.is_closed());
-}
-
-/// The same when nobody watched the key before the commit: the cell had no
-/// channel to close, and the reader that comes late is still told.
-#[tokio::test]
-async fn a_watch_taken_after_the_commit_is_already_closed() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    items.insert(&mut w, item("b", 1));
-    assert_eq!(w.commit(), 1);
-
-    let before = db.read();
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 2));
-    assert_eq!(w.commit(), 2);
-
-    let (value, mut late) = items.get_watch(&before, b"a");
-    assert_eq!(value.unwrap().0.val, 1, "the old snapshot still reads 1");
-    assert!(late.is_closed());
-    late.changed().await;
-
-    let (_, elsewhere) = items.get_watch(&before, b"b");
-    assert!(!elsewhere.is_closed());
-}
-
 /// The `Db` watch completes on the next commit that bumps the revision, which
 /// is where a reader that persists the change stream wakes up.
 #[tokio::test]
@@ -655,27 +763,54 @@ async fn a_watch_completes_when_its_db_is_dropped() {
     items.insert(&mut w, item("a", 1));
     assert_eq!(w.commit(), 1);
 
-    let r = db.read();
-    let (_, mut watch) = items.get_watch(&r, b"a");
+    let mut watch = db.watch();
     assert!(!watch.is_closed());
 
-    drop(r);
     drop(db);
     assert!(watch.is_closed());
     watch.changed().await;
 }
 
+/// A table watch takes its baseline from the snapshot it was handed, so one
+/// taken on a snapshot the database has already moved past reports the change
+/// it missed instead of parking on a commit that has been and gone.
 #[tokio::test]
-async fn a_parked_task_wakes_on_a_commit_under_its_prefix() {
+async fn a_table_watch_on_a_stale_snapshot_is_already_closed() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let mut reader = observe(&db, items);
 
+    let old = db.read();
     let mut w = db.write();
-    items.insert(&mut w, item("p/1", 1));
+    items.insert(&mut w, item("a", 1));
     assert_eq!(w.commit(), 1);
 
+    let (changes, mut watch) = reader.next(&old).unwrap();
+    assert_eq!(changes.count(), 0, "the snapshot is from before the commit");
+    assert!(watch.is_closed());
+    watch.changed().await;
+}
+
+/// The other watch: a change reader's, which completes on the next commit to
+/// its table. A task parked on it wakes without being asked again.
+#[tokio::test]
+async fn a_parked_task_wakes_on_a_commit_to_its_table() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let other = db.table("other", pk as fn(&Item) -> Key, &[]);
+    let mut reader = observe(&db, items);
+
     let r = db.read();
-    let (_, mut watch) = items.prefix_watch(&r, b"p/");
+    let (changes, mut watch) = reader.next(&r).unwrap();
+    assert_eq!(changes.count(), 0);
+    assert!(!watch.is_closed());
+
+    // A commit to another table is not a change to this one.
+    let mut w = db.write();
+    other.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+    assert!(!watch.is_closed());
+
     let waiter = tokio::spawn(async move {
         watch.changed().await;
     });
@@ -683,7 +818,7 @@ async fn a_parked_task_wakes_on_a_commit_under_its_prefix() {
     tokio::task::yield_now().await;
 
     let mut w = db.write();
-    items.insert(&mut w, item("p/2", 2));
+    items.insert(&mut w, item("a", 1));
     assert_eq!(w.commit(), 2);
 
     waiter.await.unwrap();
@@ -819,62 +954,78 @@ fn an_index_key_holding_a_zero_byte_lists_only_its_own_rows() {
     assert!(by_tenant(&db, rows, "a").is_empty());
 }
 
-#[test]
-fn an_index_watch_covers_one_index_key() {
-    let db = Db::new();
-    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
-
-    let mut w = db.write();
-    rows.insert(&mut w, row("r1", &["a"]));
-    rows.insert(&mut w, row("r9", &["b"]));
-    assert_eq!(w.commit(), 1);
-
-    let r = db.read();
-    let (_, watched) = rows.by_index_watch(&r, "tenant", b"a");
-    let (_, elsewhere) = rows.by_index_watch(&r, "tenant", b"b");
-
-    let mut w = db.write();
-    rows.insert(&mut w, row("r2", &["a"]));
-    assert_eq!(w.commit(), 2);
-
-    assert!(watched.is_closed());
-    assert!(!elsewhere.is_closed());
+fn version(revision: Revision, value: Row, deleted: bool) -> Version<Row> {
+    Version {
+        revision,
+        value: Arc::new(value),
+        deleted,
+    }
 }
 
-/// The index tree only sees the difference of the two key sets, so a row that
-/// keeps its index key keeps its entry, and the watch over that key stays open.
+/// Recovery puts a row back with the versions it had. The revisions come from
+/// what was persisted, the indexes follow the newest version, and the change
+/// stream stays empty: this is not a write for readers to follow.
 #[test]
-fn an_index_watch_ignores_an_update_that_keeps_its_key() {
+fn load_puts_a_row_back_without_a_record() {
     let db = Db::new();
     let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    let mut reader = rows.changes(&mut w);
+    w.commit();
+
+    let mut w = db.write_at(5);
+    rows.load(
+        &mut w,
+        b"r1",
+        vec![
+            version(3, row("r1", &["a"]), false),
+            version(4, row("r1", &["b"]), false),
+        ],
+    );
+    rows.load(&mut w, b"r2", vec![version(4, row("r2", &["a"]), true)]);
+    assert_eq!(w.commit(), 5);
+
+    let r = db.read();
+    assert_eq!(
+        rows.get(&r, b"r1").map(|(v, rev)| (v.key, rev)),
+        Some(("r1", 4))
+    );
+    assert!(rows.get(&r, b"r2").is_none(), "loaded as deleted");
+    assert_eq!(
+        rows.versions(&r, b"r1")
+            .iter()
+            .map(|v| (v.revision, v.value.key))
+            .collect::<Vec<_>>(),
+        [(3, "r1"), (4, "r1")]
+    );
+    // The newest version is what the indexes list.
+    assert_eq!(by_tenant(&db, rows, "b"), ["r1"]);
+    assert!(by_tenant(&db, rows, "a").is_empty());
+
+    assert!(rows.held_records(&r).is_empty());
+    assert_eq!(reader.next(&r).map(|(c, _)| c.count()).ok(), Some(0));
+}
+
+/// A record is resolved through the row it names, so a row a reader has not
+/// caught up with must not be replaced.
+#[test]
+#[should_panic(expected = "table rows holds change records a loaded row would strand")]
+fn loading_over_a_held_record_is_a_programming_error() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    let _reader = rows.changes(&mut w);
+    w.commit();
 
     let mut w = db.write();
     rows.insert(&mut w, row("r1", &["a"]));
     assert_eq!(w.commit(), 1);
 
-    let r = db.read();
-    let (_, same_tenant) = rows.by_index_watch(&r, "tenant", b"a");
     let mut w = db.write();
-    rows.insert(&mut w, row("r1", &["a"]));
-    assert_eq!(w.commit(), 2);
-    assert_eq!(
-        rows.get(&db.read(), b"r1").unwrap().1,
-        2,
-        "the row itself was rewritten"
-    );
-    assert!(!same_tenant.is_closed());
-
-    // Changing the tenant moves the entry, which both keys see.
-    let r = db.read();
-    let (_, left) = rows.by_index_watch(&r, "tenant", b"a");
-    let (_, joined) = rows.by_index_watch(&r, "tenant", b"b");
-    let mut w = db.write();
-    rows.insert(&mut w, row("r1", &["b"]));
-    assert_eq!(w.commit(), 3);
-    assert!(left.is_closed());
-    assert!(joined.is_closed());
-    assert!(by_tenant(&db, rows, "a").is_empty());
-    assert_eq!(by_tenant(&db, rows, "b"), ["r1"]);
+    rows.load(&mut w, b"r1", vec![version(2, row("r1", &["b"]), false)]);
+    w.commit();
 }
 
 #[test]
@@ -982,15 +1133,15 @@ fn table_and_compact_carry_the_head_along() {
     let mut w = db.write();
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 3);
-    assert_eq!(items.graveyard_len(&db.read()), 1);
+    assert_eq!(items.held_records(&db.read()), [3]);
 
     db.compact(3);
-    assert_eq!(items.graveyard_len(&db.read()), 0);
+    assert!(items.held_records(&db.read()).is_empty());
     let mut w = db.write();
     items.insert(&mut w, item("b", 1));
     assert_eq!(w.commit(), 4);
-    // The tombstone would be back if this commit had built on the root from
-    // before the compaction.
-    assert_eq!(items.graveyard_len(&db.read()), 0);
+    // The deletion's record would be back if this commit had built on the root
+    // from before the compaction.
+    assert_eq!(items.held_records(&db.read()), [4]);
     assert_eq!(slow.next(&db.read()).err().map(|e| e.at), Some(3));
 }
