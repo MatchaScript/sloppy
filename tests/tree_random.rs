@@ -1,9 +1,8 @@
 //! The tree against a `BTreeMap` over a fixed-seed random operation stream.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use sloppy::tree::Tree;
+use sloppy::tree::{Iter, Tree};
 
 /// Numerical Recipes LCG. Fixed seed, so a failure repeats.
 struct Lcg(u64);
@@ -30,8 +29,12 @@ impl Lcg {
     }
 }
 
-fn walked<'a>(it: impl Iterator<Item = (Vec<u8>, &'a Arc<u64>)>) -> Vec<(Vec<u8>, u64)> {
-    it.map(|(k, v)| (k, **v)).collect()
+fn walked(mut it: Iter<'_, u64>) -> Vec<(Vec<u8>, u64)> {
+    let mut out = Vec::new();
+    while let Some(v) = it.next() {
+        out.push((it.key().to_vec(), **v));
+    }
+    out
 }
 
 fn entries(tree: &Tree<u64>) -> Vec<(Vec<u8>, u64)> {
@@ -120,14 +123,12 @@ fn matches_btreemap() {
         for _ in 0..2 {
             let p = rng.key();
             let want = model_entries(model.iter().filter(|(k, _)| k.starts_with(&p)));
-            let got: Vec<_> = tree.prefix(&p).map(|(k, v)| (k, **v)).collect();
-            assert_eq!(got, want, "prefix {p:?}");
+            assert_eq!(walked(tree.prefix(&p)), want, "prefix {p:?}");
         }
         for _ in 0..2 {
             let key = rng.key();
             let want = model_entries(model.range(key.clone()..));
-            let got: Vec<_> = tree.lower_bound(&key).map(|(k, v)| (k, **v)).collect();
-            assert_eq!(got, want, "lower_bound {key:?}");
+            assert_eq!(walked(tree.lower_bound(&key)), want, "lower_bound {key:?}");
         }
     }
     assert!(!tree.is_empty());

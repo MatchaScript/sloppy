@@ -231,7 +231,7 @@ fn readers_keep_up(pipelined: bool) {
                 let snapshot = db.read();
                 let listed: Vec<_> = table
                     .by_index(&snapshot, "tenant", TENANTS[0].as_bytes())
-                    .map(|(k, v, _)| (k, v.n))
+                    .map(|(v, _)| (v.key.clone(), v.n))
                     .collect();
                 reads.loops += 1;
                 assert!(listed.len() <= usize::try_from(KEYS).unwrap() + 1);
@@ -257,7 +257,10 @@ fn readers_keep_up(pipelined: bool) {
 
     // R2 and R3: the changes alone rebuild the table, deletions included.
     let snapshot = db.read();
-    let live: BTreeMap<Vec<u8>, u64> = table.all(&snapshot).map(|(k, v, _)| (k, v.n)).collect();
+    let live: BTreeMap<Vec<u8>, u64> = table
+        .all(&snapshot)
+        .map(|(v, _)| (v.key.to_vec(), v.n))
+        .collect();
     assert_eq!(differed, live);
     assert!(live.contains_key(SENTINEL));
 
@@ -265,12 +268,12 @@ fn readers_keep_up(pipelined: bool) {
     for tenant in TENANTS {
         let want: BTreeSet<Vec<u8>> = table
             .all(&snapshot)
-            .filter(|(_, v, _)| v.tenant == tenant)
-            .map(|(k, _, _)| k)
+            .filter(|(v, _)| v.tenant == tenant)
+            .map(|(v, _)| v.key.to_vec())
             .collect();
         let listed: BTreeSet<Vec<u8>> = table
             .by_index(&snapshot, "tenant", tenant.as_bytes())
-            .map(|(k, _, _)| k)
+            .map(|(v, _)| v.key.to_vec())
             .collect();
         assert_eq!(listed, want, "index listing for {tenant}");
     }

@@ -916,18 +916,27 @@ struct Frame<'a, V> {
     len: usize,
 }
 
-/// Yields `(key, value)` in ascending byte-lexicographic order.
+/// Yields values in ascending byte-lexicographic key order.
 pub struct Iter<'a, V> {
     /// The key of the node the walk is at, rewound to each frame's `len`.
     path: Vec<u8>,
     stack: Vec<Frame<'a, V>>,
 }
 
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = (Vec<u8>, &'a Arc<V>);
+impl<V> Iter<'_, V> {
+    /// The key of the entry the last [`Iterator::next`] returned. Meaningless
+    /// before the first `next`, and after one that returned `None`.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.path
+    }
+}
 
-    // ponytail: one key `Vec` per yielded entry, none per visited node. Hand out
-    // a borrow of the path instead if even that ever matters.
+impl<'a, V> Iterator for Iter<'a, V> {
+    type Item = &'a Arc<V>;
+
+    // ponytail: no allocation per entry; the key stays in the walk's path
+    // buffer, which `key` hands out a borrow of.
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(frame) = self.stack.pop() {
             self.path.truncate(frame.len);
@@ -937,7 +946,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
                 self.stack.push(Frame { node: child, len });
             }
             if let Some(value) = frame.node.value.as_ref() {
-                return Some((self.path.clone(), value));
+                return Some(value);
             }
         }
         None
