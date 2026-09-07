@@ -99,8 +99,9 @@ impl<V> Node<V> {
 }
 
 /// Mutation keeps a replaced node alive until the commit closes its cell, which
-/// is why these need `V` to outlive the transaction.
-impl<V: 'static> Node<V> {
+/// is why these need `V` to outlive the transaction, and to be shareable: the
+/// cells wait in the `Db` until the root that owes them is published.
+impl<V: Send + Sync + 'static> Node<V> {
     /// The node this transaction may mutate: `*node` itself when this
     /// transaction built it, a path copy of it otherwise.
     ///
@@ -146,7 +147,7 @@ impl<V> Drop for Node<V> {
 }
 
 /// A replaced node closes its subtree cell, and holds it alive until then.
-impl<V> Closes for Node<V> {
+impl<V: Send + Sync> Closes for Node<V> {
     fn close(&self) {
         self.subtree.close();
     }
@@ -958,7 +959,7 @@ pub struct Txn<V> {
     w: Writing,
 }
 
-impl<V: 'static> Txn<V> {
+impl<V: Send + Sync + 'static> Txn<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&Arc<V>> {
         descend(&self.root, key).0
@@ -1027,7 +1028,7 @@ impl<V: 'static> Txn<V> {
 ///
 /// A loop, not a recursion: the depth is the length of the longest chain of
 /// keys that are each a prefix of the next, which the keys' owner controls.
-fn insert<V: 'static>(
+fn insert<V: Send + Sync + 'static>(
     mut node: &mut Arc<Node<V>>,
     mut key: &[u8],
     value: Arc<V>,
@@ -1083,7 +1084,11 @@ fn insert<V: 'static>(
 /// The way down owns every node on the path and takes each next node out of
 /// its parent's slot, so the way back up holds one node at a time: it puts the
 /// child back, drops it if it is gone, and shrinks the parent.
-fn delete<V: 'static>(root: &mut Arc<Node<V>>, key: &[u8], w: &mut Writing) -> Arc<V> {
+fn delete<V: Send + Sync + 'static>(
+    root: &mut Arc<Node<V>>,
+    key: &[u8],
+    w: &mut Writing,
+) -> Arc<V> {
     let mut node = std::mem::replace(root, Node::new(&[], None, Children::empty(), 0));
     let mut rest = key;
     let mut path: Vec<(Arc<Node<V>>, u8)> = Vec::new();
@@ -1123,7 +1128,11 @@ fn delete<V: 'static>(root: &mut Arc<Node<V>>, key: &[u8], w: &mut Writing) -> A
 /// that child. The root always stays, with an empty prefix.
 ///
 /// Returns whether the node is gone.
-fn shrink<V: 'static>(node: &mut Arc<Node<V>>, is_root: bool, w: &mut Writing) -> bool {
+fn shrink<V: Send + Sync + 'static>(
+    node: &mut Arc<Node<V>>,
+    is_root: bool,
+    w: &mut Writing,
+) -> bool {
     if is_root || node.value.is_some() {
         return false;
     }

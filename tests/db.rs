@@ -862,14 +862,14 @@ fn a_prepared_root_is_invisible_until_publish() {
 
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
-    let prepared = w.prepare();
+    assert_eq!(w.prepare(), 2);
 
     let r = db.read();
     assert_eq!(r.revision(), 1);
     assert!(items.get(&r, b"b").is_none());
     assert_eq!(items.all(&r).count(), 1);
 
-    assert_eq!(db.publish(prepared), 2);
+    assert_eq!(db.publish(), 2);
     let r = db.read();
     assert_eq!(r.revision(), 2);
     assert_eq!(
@@ -891,7 +891,7 @@ fn a_write_after_prepare_reads_the_prepared_root() {
 
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
-    let first = w.prepare();
+    assert_eq!(w.prepare(), 2);
 
     let mut w = db.write();
     assert_eq!(
@@ -904,10 +904,10 @@ fn a_write_after_prepare_reads_the_prepared_root() {
         items.get(&w, b"c").map(|(v, rev)| (v.val, rev)),
         Some((3, 3))
     );
-    let second = w.prepare();
+    assert_eq!(w.prepare(), 3);
 
-    assert_eq!(db.publish(first), 2);
-    assert_eq!(db.publish(second), 3);
+    assert_eq!(db.publish(), 2);
+    assert_eq!(db.publish(), 3);
     assert_eq!(items.all(&db.read()).count(), 3);
 }
 
@@ -918,14 +918,14 @@ fn two_prepared_roots_publish_one_revision_each() {
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
-    let first = w.prepare();
+    assert_eq!(w.prepare(), 1);
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
-    let second = w.prepare();
+    assert_eq!(w.prepare(), 2);
 
-    assert_eq!(db.publish(first), 1);
+    assert_eq!(db.publish(), 1);
     assert_eq!(db.read().revision(), 1);
-    assert_eq!(db.publish(second), 2);
+    assert_eq!(db.publish(), 2);
     assert_eq!(db.read().revision(), 2);
 
     let r = db.read();
@@ -933,61 +933,162 @@ fn two_prepared_roots_publish_one_revision_each() {
     assert_eq!(items.get(&r, b"b").unwrap().1, 2);
 }
 
-/// Publishing the older of two prepared roots leaves `head` on the newer one,
+/// Publishing the older of two prepared roots leaves the newer one queued,
 /// so the next transaction carries the chain on rather than forking it.
 #[test]
-fn publishing_the_older_root_keeps_head_on_the_newer() {
+fn publishing_the_older_root_keeps_the_newer_queued() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
-    let first = w.prepare();
+    assert_eq!(w.prepare(), 1);
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
-    let second = w.prepare();
-    assert_eq!(db.publish(first), 1);
+    assert_eq!(w.prepare(), 2);
+    assert_eq!(db.publish(), 1);
 
     let mut w = db.write();
     assert_eq!(items.get(&w, b"b").unwrap().1, 2);
     items.insert(&mut w, item("c", 3));
-    let third = w.prepare();
-    assert_eq!(db.publish(second), 2);
-    assert_eq!(db.publish(third), 3);
+    assert_eq!(w.prepare(), 3);
+    assert_eq!(db.publish(), 2);
+    assert_eq!(db.publish(), 3);
     assert_eq!(items.all(&db.read()).count(), 3);
 }
 
+/// Two writers running flat out: the writer lock covers the whole commit, so
+/// the revisions come out in order, once each, and neither writer is lost.
 #[test]
-#[should_panic(expected = "prepared on an older one")]
-fn publishing_out_of_order_panics() {
-    let db = Db::new();
+fn commits_from_two_threads_serialize() {
+    const ROUNDS: u32 = 5_000;
+
+    let db = Arc::new(Db::new());
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let seen: Vec<Vec<Revision>> = ["a", "b"]
+        .map(|key| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                (0..ROUNDS)
+                    .map(|n| {
+                        let mut w = db.write();
+                        items.insert(&mut w, item(key, n));
+                        w.commit()
+                    })
+                    .collect()
+            })
+        })
+        .map(|thread| thread.join().expect("a writer panicked"))
+        .into();
 
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    let _first = w.prepare();
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    let second = w.prepare();
+    for revisions in &seen {
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] < pair[1]),
+            "one thread's revisions went backwards"
+        );
+    }
+    let mut every = seen.concat();
+    every.sort_unstable();
+    assert_eq!(
+        every,
+        (1..=Revision::from(ROUNDS) * 2).collect::<Vec<_>>(),
+        "every commit took one revision of its own"
+    );
 
-    db.publish(second);
+    let r = db.read();
+    assert_eq!(items.all(&r).count(), 2, "both writers' keys are there");
+    assert_eq!(items.get(&r, b"a").unwrap().0.val, ROUNDS - 1);
+    assert_eq!(items.get(&r, b"b").unwrap().0.val, ROUNDS - 1);
 }
 
-/// `commit` is `prepare` then `publish`, and the transaction opened on the
-/// prepared root, so the parent check is what reports the misuse.
+/// `commit` publishes under the writer lock, which the queue in front of it
+/// would break: the transaction opened on a root no reader has seen.
 #[test]
-#[should_panic(expected = "prepared on an older one")]
+#[should_panic(expected = "commit with a prepared root still unpublished")]
 fn a_commit_with_a_prepared_root_outstanding_panics() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
-    let _prepared = w.prepare();
+    w.prepare();
 
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
     w.commit();
+}
+
+#[test]
+#[should_panic(expected = "publish with nothing prepared")]
+fn publishing_with_nothing_prepared_panics() {
+    let db = Db::new();
+    db.publish();
+}
+
+/// `table` replaces the visible root, so a prepared root, which was built on
+/// that root and not on the new one, would lose its table.
+#[test]
+#[should_panic(expected = "table registered with a prepared root still unpublished")]
+fn registering_a_table_with_a_prepared_root_panics() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    w.prepare();
+
+    db.table("late", pk as fn(&Item) -> Key, &[]);
+}
+
+#[test]
+#[should_panic(expected = "compact with a prepared root still unpublished")]
+fn compacting_with_a_prepared_root_panics() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    w.prepare();
+
+    db.compact(1);
+}
+
+/// A transaction that touched nothing still takes its place in the queue, so
+/// prepare and publish stay one for one. It installs the root it opened on:
+/// no revision, no hook.
+#[test]
+fn an_empty_transaction_publishes_without_a_revision() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    let db = Db::with_hook(move |rev: Revision, _: &ReadTxn| seen.lock().unwrap().push(rev));
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    assert_eq!(db.write().prepare(), 1);
+    assert_eq!(db.publish(), 1);
+    assert_eq!(db.read().revision(), 1);
+    assert_eq!(*calls.lock().unwrap(), vec![1], "only the first commit");
+}
+
+/// The reader an abandoned root registered goes back to unregistered: its
+/// registration never became visible, so it holds nothing back and reports the
+/// misuse rather than skipping the changes it never observed.
+#[test]
+#[should_panic(expected = "registration transaction did not commit")]
+fn a_change_reader_from_an_abandoned_root_is_unregistered() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    let mut reader = items.changes(&mut w);
+    items.insert(&mut w, item("a", 1));
+    w.prepare();
+    db.abandon();
+
+    let _ = reader.next(&db.read());
 }
 
 #[test]
@@ -1001,7 +1102,8 @@ fn a_write_after_abandon_opens_on_the_visible_root() {
 
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
-    db.abandon(w.prepare());
+    w.prepare();
+    db.abandon();
 
     let mut w = db.write();
     assert!(items.get(&w, b"b").is_none(), "the abandoned root is gone");
@@ -1060,8 +1162,8 @@ fn a_registration_only_transaction_publishes_its_root() {
 
     let mut w = db.write();
     let mut reader = items.changes(&mut w);
-    let prepared = w.prepare();
-    assert_eq!(db.publish(prepared), 1);
+    assert_eq!(w.prepare(), 1);
+    assert_eq!(db.publish(), 1);
 
     let mut w = db.write();
     items.insert(&mut w, item("b", 2));
@@ -1082,10 +1184,10 @@ fn the_hook_runs_on_publish_not_prepare() {
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
-    let prepared = w.prepare();
+    assert_eq!(w.prepare(), 1);
     assert!(calls.lock().unwrap().is_empty());
 
-    assert_eq!(db.publish(prepared), 1);
+    assert_eq!(db.publish(), 1);
     assert_eq!(*calls.lock().unwrap(), vec![1]);
 }
 
@@ -1101,10 +1203,10 @@ async fn a_watch_completes_on_publish_not_prepare() {
     let (_, mut watch) = items.get_watch(&db.read(), b"a");
     let mut w = db.write();
     items.insert(&mut w, item("a", 2));
-    let prepared = w.prepare();
+    assert_eq!(w.prepare(), 2);
     assert!(!watch.is_closed(), "the prepared root is not visible yet");
 
-    assert_eq!(db.publish(prepared), 2);
+    assert_eq!(db.publish(), 2);
     assert!(watch.is_closed());
     watch.changed().await;
 }
@@ -1123,13 +1225,13 @@ async fn a_watch_taken_between_prepare_and_publish_completes_on_publish() {
     let visible = db.read();
     let mut w = db.write();
     items.insert(&mut w, item("a", 2));
-    let prepared = w.prepare();
+    assert_eq!(w.prepare(), 2);
 
     let (value, mut late) = items.get_watch(&visible, b"a");
     assert_eq!(value.unwrap().0.val, 1, "the visible root still reads 1");
     assert!(!late.is_closed());
 
-    assert_eq!(db.publish(prepared), 2);
+    assert_eq!(db.publish(), 2);
     assert!(late.is_closed());
     late.changed().await;
 }

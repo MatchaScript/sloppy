@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sloppy::db::{Change, Db, Index, Key, Prepared};
+use sloppy::db::{Change, Db, Index, Key};
 
 const KEYS: u64 = 200;
 const COMMITS: usize = 2_000;
@@ -131,7 +131,7 @@ fn readers_keep_up(pipelined: bool) {
         let (db, finish) = (db.clone(), finish.clone());
         thread::spawn(move || {
             let mut rng = Lcg(0x2026_0904);
-            let mut flight: Option<Prepared> = None;
+            let mut flight = false;
             let start = Instant::now();
             for round in 0..COMMITS {
                 let mut w = db.write();
@@ -147,17 +147,18 @@ fn readers_keep_up(pipelined: bool) {
                 }
                 if pipelined {
                     // Prepare this round on top of the one in flight, then
-                    // publish that one. `head` stays on this round's root.
-                    let next = w.prepare();
-                    if let Some(prev) = flight.replace(next) {
-                        db.publish(prev);
+                    // publish that one. The next write opens on this round.
+                    w.prepare();
+                    if flight {
+                        db.publish();
                     }
+                    flight = true;
                 } else {
                     w.commit();
                 }
             }
-            if let Some(prev) = flight.take() {
-                db.publish(prev);
+            if flight {
+                db.publish();
             }
             let last = db.read().revision() + 1;
             finish.store(last, Ordering::SeqCst);

@@ -164,10 +164,10 @@ fn bench(n: u64) {
         let mut txn = db.write();
         table.insert(&mut txn, value);
         let clock = Instant::now();
-        let prepared = txn.prepare();
+        txn.prepare();
         preparing += clock.elapsed();
         let clock = Instant::now();
-        db.publish(prepared);
+        db.publish();
         publishing += clock.elapsed();
     }
     println!("N={n} prepare {}", ns(preparing, 10_000));
