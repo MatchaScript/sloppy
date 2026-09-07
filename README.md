@@ -1,7 +1,7 @@
 # sloppy
 
 In-memory keyspace with snapshot reads, revision-indexed changes, and watches.
-Tables hold values behind a persistent adaptive radix tree; a write transaction
+Tables hold values behind a persistent B+tree; a write transaction
 builds a new root and publishes it, readers keep the root they opened.
 
 ## Notice

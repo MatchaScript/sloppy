@@ -1,9 +1,9 @@
-//! Row 2 and row 3 of the plan: root cell, transactions, revision, hook,
-//! revision index, graveyard, `changes`, watermark, `compact`.
+//! Row 2 and row 3 of the plan: root cell, transactions, revision, the change
+//! stream, watches, the watermark, `compact`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use sloppy::db::{Change, ChangeIterator, Db, Index, Key, ReadTxn, Revision, Table};
+use sloppy::db::{Change, ChangeIterator, Db, Index, Key, Revision, Table};
 
 #[derive(Debug)]
 struct Item {
@@ -130,9 +130,7 @@ fn a_write_txn_reads_its_own_writes() {
 
 #[test]
 fn abort_leaves_nothing() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let seen = calls.clone();
-    let db = Db::with_hook(move |rev: Revision, _: &ReadTxn| seen.lock().unwrap().push(rev));
+    let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
     let mut w = db.write();
@@ -151,7 +149,6 @@ fn abort_leaves_nothing() {
 
     // An empty transaction commits to the same revision.
     assert_eq!(db.write().commit(), 1);
-    assert_eq!(*calls.lock().unwrap(), vec![1]);
 }
 
 #[test]
@@ -164,51 +161,6 @@ fn a_change_reader_rejects_an_aborted_registration() {
     drop(w);
 
     let _ = reader.next(&db.read());
-}
-
-#[test]
-fn hook_sees_each_commit_once() {
-    type Log = Vec<(Revision, Vec<(String, Revision, bool)>)>;
-    let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(Vec::new()));
-    let iter: Arc<Mutex<Option<ChangeIterator<Item>>>> = Arc::new(Mutex::new(None));
-
-    let (log_in, iter_in) = (log.clone(), iter.clone());
-    let db = Db::with_hook(move |rev: Revision, txn: &ReadTxn| {
-        let mut slot = iter_in.lock().unwrap();
-        let changes = slot
-            .as_mut()
-            .map(|it| drain(it.next(txn).unwrap().0))
-            .unwrap_or_default();
-        log_in.lock().unwrap().push((rev, changes));
-    });
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    // Registering costs a commit but no revision: the hook is not called.
-    let mut w = db.write();
-    *iter.lock().unwrap() = Some(items.changes(&mut w));
-    assert_eq!(w.commit(), 1);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 7));
-    assert_eq!(w.commit(), 2);
-
-    let mut w = db.write();
-    items.delete(&mut w, b"a");
-    items.insert(&mut w, item("c", 9));
-    assert_eq!(w.commit(), 3);
-
-    assert_eq!(
-        *log.lock().unwrap(),
-        vec![
-            (1, vec![]),
-            (2, vec![("b".into(), 2, false)]),
-            (3, vec![("c".into(), 3, false), ("a".into(), 3, true)]),
-        ]
-    );
 }
 
 #[test]
@@ -290,6 +242,30 @@ fn changes_report_the_last_state_of_each_key() {
     assert_eq!(drain(changes), vec![("c".into(), 6, true)]);
 }
 
+/// One key written twice in one commit leaves two records, in the order they
+/// were written; written again in a later commit it leaves one, because the
+/// second write drops the record the first left.
+#[test]
+fn a_key_written_twice_in_one_commit_leaves_both_records() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let mut reader = observe(&db, items);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    items.insert(&mut w, item("a", 2));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 3));
+    assert_eq!(w.commit(), 2);
+
+    assert_eq!(
+        drain(reader.next(&db.read()).unwrap().0),
+        vec![("a".into(), 1, false), ("a".into(), 2, false)]
+    );
+}
+
 #[test]
 fn graveyard_holds_until_every_reader_has_read() {
     let db = Db::new();
@@ -347,6 +323,40 @@ fn dropping_a_reader_releases_the_graveyard() {
     items.insert(&mut w, item("b", 1));
     assert_eq!(w.commit(), 3);
     assert_eq!(items.graveyard_len(&db.read()), 0);
+}
+
+/// Rebuilding a table by deleting every key and writing it again leaves one
+/// record per key, not a deletion on top of it: the write takes the place of
+/// the deletion it undoes, so a reader that has stalled holds back one
+/// generation of the table rather than one per rebuild.
+#[test]
+fn re_creating_a_key_in_the_same_commit_replaces_its_deletion() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    for key in ["a", "b"] {
+        items.insert(&mut w, item(key, 1));
+    }
+    assert_eq!(w.commit(), 1);
+
+    let mut stalled = observe(&db, items);
+    for round in 2..5 {
+        let mut w = db.write();
+        for key in ["a", "b"] {
+            items.delete(&mut w, key.as_bytes());
+        }
+        for key in ["a", "b"] {
+            items.insert(&mut w, item(key, round));
+        }
+        w.commit();
+        assert_eq!(items.graveyard_len(&db.read()), 0, "round {round}");
+    }
+
+    assert_eq!(
+        drain(stalled.next(&db.read()).unwrap().0),
+        vec![("a".into(), 4, false), ("b".into(), 4, false)]
+    );
 }
 
 #[test]
@@ -612,6 +622,49 @@ async fn a_watch_taken_after_the_commit_is_already_closed() {
     assert!(!elsewhere.is_closed());
 }
 
+/// The `Db` watch completes on the next commit that bumps the revision, which
+/// is where a reader that persists the change stream wakes up.
+#[tokio::test]
+async fn a_db_watch_completes_on_the_next_revision() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut watch = db.watch();
+    assert!(!watch.is_closed());
+    // A transaction that writes nothing takes no revision, so it is not a
+    // change to wake on.
+    assert_eq!(db.write().commit(), 0);
+    assert!(!watch.is_closed());
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    assert!(watch.is_closed());
+    watch.changed().await;
+}
+
+/// A watch outlives the database it came from, and there is no commit left to
+/// wake it, so dropping the `Db` has to release it.
+#[tokio::test]
+async fn a_watch_completes_when_its_db_is_dropped() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let r = db.read();
+    let (_, mut watch) = items.get_watch(&r, b"a");
+    assert!(!watch.is_closed());
+
+    drop(r);
+    drop(db);
+    assert!(watch.is_closed());
+    watch.changed().await;
+}
+
 #[tokio::test]
 async fn a_parked_task_wakes_on_a_commit_under_its_prefix() {
     let db = Db::new();
@@ -749,6 +802,23 @@ fn an_index_follows_the_values_it_covers() {
     assert_eq!(listed, [("r2", 1)]);
 }
 
+/// An index key is arbitrary bytes. The entry keeps it apart from the primary
+/// key that follows it, so a key holding the byte the two used to be joined
+/// with is still only found by itself.
+#[test]
+fn an_index_key_holding_a_zero_byte_lists_only_its_own_rows() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("p", &["a\0b"]));
+    rows.insert(&mut w, row("b\0p", &["z"]));
+    assert_eq!(w.commit(), 1);
+
+    assert_eq!(by_tenant(&db, rows, "a\0b"), ["p"]);
+    assert!(by_tenant(&db, rows, "a").is_empty());
+}
+
 #[test]
 fn an_index_watch_covers_one_index_key() {
     let db = Db::new();
@@ -845,113 +915,7 @@ fn table_handle_rejects_another_db_after_its_slot_was_opened() {
     ta.insert(&mut w, item("foreign", 2));
 }
 
-// -------------------------------------------------------- prepare and publish
-
-#[test]
-fn a_prepared_root_is_invisible_until_publish() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    assert_eq!(w.prepare(), 2);
-
-    let r = db.read();
-    assert_eq!(r.revision(), 1);
-    assert!(items.get(&r, b"b").is_none());
-    assert_eq!(items.all(&r).count(), 1);
-
-    assert_eq!(db.publish(), 2);
-    let r = db.read();
-    assert_eq!(r.revision(), 2);
-    assert_eq!(
-        items.get(&r, b"b").map(|(v, rev)| (v.val, rev)),
-        Some((2, 2))
-    );
-}
-
-/// A transaction opened while a prepared root is outstanding builds on it, so
-/// its own reads see the prepared content and its writes carry on the chain.
-#[test]
-fn a_write_after_prepare_reads_the_prepared_root() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    assert_eq!(w.prepare(), 2);
-
-    let mut w = db.write();
-    assert_eq!(
-        items.get(&w, b"b").map(|(v, rev)| (v.val, rev)),
-        Some((2, 2))
-    );
-    assert_eq!(items.all(&w).count(), 2);
-    items.insert(&mut w, item("c", 3));
-    assert_eq!(
-        items.get(&w, b"c").map(|(v, rev)| (v.val, rev)),
-        Some((3, 3))
-    );
-    assert_eq!(w.prepare(), 3);
-
-    assert_eq!(db.publish(), 2);
-    assert_eq!(db.publish(), 3);
-    assert_eq!(items.all(&db.read()).count(), 3);
-}
-
-#[test]
-fn two_prepared_roots_publish_one_revision_each() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.prepare(), 1);
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    assert_eq!(w.prepare(), 2);
-
-    assert_eq!(db.publish(), 1);
-    assert_eq!(db.read().revision(), 1);
-    assert_eq!(db.publish(), 2);
-    assert_eq!(db.read().revision(), 2);
-
-    let r = db.read();
-    assert_eq!(items.get(&r, b"a").unwrap().1, 1);
-    assert_eq!(items.get(&r, b"b").unwrap().1, 2);
-}
-
-/// Publishing the older of two prepared roots leaves the newer one queued,
-/// so the next transaction carries the chain on rather than forking it.
-#[test]
-fn publishing_the_older_root_keeps_the_newer_queued() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.prepare(), 1);
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    assert_eq!(w.prepare(), 2);
-    assert_eq!(db.publish(), 1);
-
-    let mut w = db.write();
-    assert_eq!(items.get(&w, b"b").unwrap().1, 2);
-    items.insert(&mut w, item("c", 3));
-    assert_eq!(w.prepare(), 3);
-    assert_eq!(db.publish(), 2);
-    assert_eq!(db.publish(), 3);
-    assert_eq!(items.all(&db.read()).count(), 3);
-}
+// ---------------------------------------------------------- commit ordering
 
 /// Two writers running flat out: the writer lock covers the whole commit, so
 /// the revisions come out in order, once each, and neither writer is lost.
@@ -997,120 +961,6 @@ fn commits_from_two_threads_serialize() {
     assert_eq!(items.get(&r, b"b").unwrap().0.val, ROUNDS - 1);
 }
 
-/// `commit` publishes under the writer lock, which the queue in front of it
-/// would break: the transaction opened on a root no reader has seen.
-#[test]
-#[should_panic(expected = "commit with a prepared root still unpublished")]
-fn a_commit_with_a_prepared_root_outstanding_panics() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    w.prepare();
-
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    w.commit();
-}
-
-#[test]
-#[should_panic(expected = "publish with nothing prepared")]
-fn publishing_with_nothing_prepared_panics() {
-    let db = Db::new();
-    db.publish();
-}
-
-/// `table` replaces the visible root, so a prepared root, which was built on
-/// that root and not on the new one, would lose its table.
-#[test]
-#[should_panic(expected = "table registered with a prepared root still unpublished")]
-fn registering_a_table_with_a_prepared_root_panics() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    w.prepare();
-
-    db.table("late", pk as fn(&Item) -> Key, &[]);
-}
-
-#[test]
-#[should_panic(expected = "compact with a prepared root still unpublished")]
-fn compacting_with_a_prepared_root_panics() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    w.prepare();
-
-    db.compact(1);
-}
-
-/// A transaction that touched nothing still takes its place in the queue, so
-/// prepare and publish stay one for one. It installs the root it opened on:
-/// no revision, no hook.
-#[test]
-fn an_empty_transaction_publishes_without_a_revision() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let seen = calls.clone();
-    let db = Db::with_hook(move |rev: Revision, _: &ReadTxn| seen.lock().unwrap().push(rev));
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    assert_eq!(db.write().prepare(), 1);
-    assert_eq!(db.publish(), 1);
-    assert_eq!(db.read().revision(), 1);
-    assert_eq!(*calls.lock().unwrap(), vec![1], "only the first commit");
-}
-
-/// The reader an abandoned root registered goes back to unregistered: its
-/// registration never became visible, so it holds nothing back and reports the
-/// misuse rather than skipping the changes it never observed.
-#[test]
-#[should_panic(expected = "registration transaction did not commit")]
-fn a_change_reader_from_an_abandoned_root_is_unregistered() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    let mut reader = items.changes(&mut w);
-    items.insert(&mut w, item("a", 1));
-    w.prepare();
-    db.abandon();
-
-    let _ = reader.next(&db.read());
-}
-
-#[test]
-fn a_write_after_abandon_opens_on_the_visible_root() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    w.prepare();
-    db.abandon();
-
-    let mut w = db.write();
-    assert!(items.get(&w, b"b").is_none(), "the abandoned root is gone");
-    items.insert(&mut w, item("c", 3));
-    assert_eq!(w.commit(), 2);
-
-    let r = db.read();
-    assert_eq!(items.all(&r).count(), 2);
-    assert_eq!(items.get(&r, b"c").unwrap().1, 2);
-}
-
 /// `table` and `compact` replace the visible root between transactions, and the
 /// next `write` has to open on what they left, not on the root before them.
 #[test]
@@ -1143,91 +993,4 @@ fn table_and_compact_carry_the_head_along() {
     // before the compaction.
     assert_eq!(items.graveyard_len(&db.read()), 0);
     assert_eq!(slow.next(&db.read()).err().map(|e| e.at), Some(3));
-}
-
-/// Registering costs no revision but still installs a root, which is what
-/// carries the new tracker.
-#[test]
-fn a_registration_only_transaction_publishes_its_root() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let mut w = db.write();
-    let mut reader = items.changes(&mut w);
-    assert_eq!(w.prepare(), 1);
-    assert_eq!(db.publish(), 1);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 2));
-    assert_eq!(w.commit(), 2);
-
-    assert_eq!(
-        drain(reader.next(&db.read()).unwrap().0),
-        vec![("b".into(), 2, false)]
-    );
-}
-
-#[test]
-fn the_hook_runs_on_publish_not_prepare() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let seen = calls.clone();
-    let db = Db::with_hook(move |rev: Revision, _: &ReadTxn| seen.lock().unwrap().push(rev));
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.prepare(), 1);
-    assert!(calls.lock().unwrap().is_empty());
-
-    assert_eq!(db.publish(), 1);
-    assert_eq!(*calls.lock().unwrap(), vec![1]);
-}
-
-#[tokio::test]
-async fn a_watch_completes_on_publish_not_prepare() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let (_, mut watch) = items.get_watch(&db.read(), b"a");
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 2));
-    assert_eq!(w.prepare(), 2);
-    assert!(!watch.is_closed(), "the prepared root is not visible yet");
-
-    assert_eq!(db.publish(), 2);
-    assert!(watch.is_closed());
-    watch.changed().await;
-}
-
-/// The cell the prepared root owes is closed at publish, not dropped at
-/// prepare, so a reader that subscribes in between gets an open watch.
-#[tokio::test]
-async fn a_watch_taken_between_prepare_and_publish_completes_on_publish() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let visible = db.read();
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 2));
-    assert_eq!(w.prepare(), 2);
-
-    let (value, mut late) = items.get_watch(&visible, b"a");
-    assert_eq!(value.unwrap().0.val, 1, "the visible root still reads 1");
-    assert!(!late.is_closed());
-
-    assert_eq!(db.publish(), 2);
-    assert!(late.is_closed());
-    late.changed().await;
 }
