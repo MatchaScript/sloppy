@@ -65,21 +65,22 @@ struct Node<V> {
     subtree: Cell,
     /// Closed only by a commit that writes or removes this node's own value, so
     /// it outlives the node and is shared by every copy that keeps the value.
-    value_cell: Arc<Cell>,
+    value_cell: Option<Arc<Cell>>,
     /// The transaction that created this node. While that transaction runs, the
     /// node is reachable only from its root, so it can be mutated in place.
     txn: TxnId,
 }
 
 impl<V> Node<V> {
-    /// The value is new here, so its cell starts fresh.
+    /// The value is new here, so its cell starts fresh if a value is present.
     fn new(prefix: &[u8], value: Option<V>, children: Children<V>, txn: TxnId) -> Arc<Self> {
+        let value_cell = value.is_some().then(Arc::default);
         Arc::new(Self {
             prefix: Prefix::new(prefix),
             value,
             children,
             subtree: Cell::default(),
-            value_cell: Arc::default(),
+            value_cell,
             txn,
         })
     }
@@ -299,16 +300,11 @@ impl<V> Node48<V> {
     fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
         // The slots stay in key order, so the new one lands after every child
         // below `byte` and the index entries behind it move up.
-        let at = self.index[..usize::from(byte)]
-            .iter()
-            .filter(|slot| **slot != 0)
-            .count();
         let end = usize::from(self.len);
+        let at = self.slots[..end].partition_point(|s| key_of(s.as_ref()) < byte);
         self.slots[at..=end].rotate_right(1);
-        for slot in &mut self.index {
-            if usize::from(*slot) > at {
-                *slot += 1;
-            }
+        for slot in &self.slots[at + 1..=end] {
+            self.index[usize::from(key_of(slot.as_ref()))] += 1;
         }
         self.index[usize::from(byte)] = u8::try_from(at + 1).expect("node48 holds 48 slots");
         self.slots[at] = Some(child);
@@ -322,10 +318,8 @@ impl<V> Node48<V> {
         self.slots[at..end].rotate_left(1);
         self.slots[end - 1] = None;
         self.index[usize::from(byte)] = 0;
-        for slot in &mut self.index {
-            if usize::from(*slot) > at + 1 {
-                *slot -= 1;
-            }
+        for slot in &self.slots[at..end - 1] {
+            self.index[usize::from(key_of(slot.as_ref()))] -= 1;
         }
         self.len -= 1;
     }
@@ -832,10 +826,9 @@ impl<V> Tree<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> (Option<&V>, Watch) {
         let (value, node) = descend(&self.root, key);
-        let watch = if value.is_some() {
-            node.value_cell.watch()
-        } else {
-            node.subtree.watch()
+        let watch = match (value, &node.value_cell) {
+            (Some(_), Some(cell)) => cell.watch(),
+            _ => node.subtree.watch(),
         };
         (value, watch)
     }
@@ -1065,12 +1058,11 @@ fn insert<V: Clone + Send + Sync + 'static>(
         }
 
         if common == key.len() {
-            // On a valueless node this closes a cell nobody holds: `get` hands out
-            // the value cell only for a key that exists, and the watch on the
-            // missing key is the subtree cell that `own` closes.
-            w.closed.push(node.value_cell.clone());
+            if let Some(cell) = &node.value_cell {
+                w.closed.push(cell.clone());
+            }
             let n = Node::own(node, w);
-            n.value_cell = Arc::default();
+            n.value_cell = Some(Arc::default());
             return n.value.replace(value);
         }
 
@@ -1114,9 +1106,11 @@ fn delete<V: Clone + Send + Sync + 'static>(
         node = child;
     }
 
-    w.closed.push(node.value_cell.clone());
+    if let Some(cell) = &node.value_cell {
+        w.closed.push(cell.clone());
+    }
     let n = Node::own(&mut node, w);
-    n.value_cell = Arc::default();
+    n.value_cell = None;
     let old = n.value.take().expect("the key was looked up first");
 
     let mut gone = shrink(&mut node, path.is_empty(), w);
@@ -1197,10 +1191,16 @@ mod lookup {
 
         assert_eq!(tree.value(b"a").copied(), Some(1));
         let node = descend(&tree.root, b"a").1;
-        assert!(!node.value_cell.has_channel(), "`value` watches nothing");
+        assert!(
+            !node.value_cell.as_ref().unwrap().has_channel(),
+            "`value` watches nothing"
+        );
 
         let (_, watch) = tree.get(b"a");
-        assert!(node.value_cell.has_channel(), "`get` hands out a watch");
+        assert!(
+            node.value_cell.as_ref().unwrap().has_channel(),
+            "`get` hands out a watch"
+        );
         drop(watch);
     }
 }

@@ -42,11 +42,11 @@ impl<V> Clone for Object<V> {
 /// unique index key. Here one revision covers a whole
 /// commit, so the primary key is appended to keep the entries of one commit
 /// apart. The ordering is unchanged: revision first, ascending.
-fn rev_key(revision: Revision, key: &[u8]) -> Key {
-    let mut k = Vec::with_capacity(8 + key.len());
-    k.extend_from_slice(&revision.to_be_bytes());
-    k.extend_from_slice(key);
-    k.into()
+fn rev_key_into<'b>(buf: &'b mut Vec<u8>, revision: Revision, key: &[u8]) -> &'b [u8] {
+    buf.clear();
+    buf.extend_from_slice(&revision.to_be_bytes());
+    buf.extend_from_slice(key);
+    buf
 }
 
 fn revision_of(rev_key: &[u8]) -> Revision {
@@ -58,17 +58,23 @@ fn row<V>(obj: &Object<V>) -> (&V, Revision) {
     (obj.value.as_ref(), obj.revision)
 }
 
-/// Resolves index hits (the primary keys they list) through the primary tree.
+/// Resolves index hits through the primary tree, reading the primary key off
+/// the index entry's key rather than storing it as a value.
 fn resolve<'a, V>(
     entry: &'a TableEntry<V>,
-    hits: tree::Iter<'a, Key>,
+    mut hits: tree::Iter<'a, ()>,
 ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V> {
-    hits.map(move |primary| {
+    std::iter::from_fn(move || {
+        hits.next()?;
+        let entry_key = hits.key();
+        let index_key_len =
+            u32::from_be_bytes(entry_key[..4].try_into().expect("valid index entry")) as usize;
+        let primary = &entry_key[4 + index_key_len..];
         let object = entry
             .primary
             .value(primary)
             .expect("index disagrees with the primary tree");
-        (object.value.as_ref(), object.revision)
+        Some((object.value.as_ref(), object.revision))
     })
 }
 
@@ -111,10 +117,13 @@ fn sorted(mut keys: Vec<Key>) -> Vec<Key> {
 
 /// Key of an index entry: the search prefix, then the primary key, which keeps
 /// the entries of one index key apart.
-fn index_entry(index_key: &[u8], primary: &[u8]) -> Key {
-    let mut k = index_prefix(index_key);
-    k.extend_from_slice(primary);
-    k.into()
+fn index_entry_into<'b>(buf: &'b mut Vec<u8>, index_key: &[u8], primary: &[u8]) -> &'b [u8] {
+    let len = u32::try_from(index_key.len()).expect("index key longer than 4 GiB");
+    buf.clear();
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(index_key);
+    buf.extend_from_slice(primary);
+    buf
 }
 
 // ---------------------------------------------------------------- table entry
@@ -124,14 +133,14 @@ struct TableEntry<V> {
     /// Revision of the last commit that changed this table.
     revision: Revision,
     primary: Tree<Object<V>>,
-    /// `rev_key(revision, primary key) -> primary key`.
-    rev_index: Tree<Key>,
+    /// Keyed by the revision, big-endian, then the primary key.
+    rev_index: Tree<()>,
     /// Deleted objects, by primary key, at their delete revision.
     graveyard: Tree<Object<V>>,
-    graveyard_rev: Tree<Key>,
+    graveyard_rev: Tree<()>,
     /// One tree per registered index, in registration order.
-    /// `index_entry(index key, primary key) -> primary key`.
-    indexes: Vec<(Index<V>, Tree<Key>)>,
+    /// Keyed by the index key with its length in front, then the primary key.
+    indexes: Vec<(Index<V>, Tree<()>)>,
     trackers: Vec<Weak<AtomicU64>>,
     /// Highest delete revision that [`Db::compact`] removed before every
     /// tracker had seen it. A reader below this has lost a change.
@@ -187,7 +196,7 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
         let mut removed = 0usize;
         let mut lost = self.lost;
         let mut it = self.graveyard_rev.iter();
-        while let Some(primary_key) = it.next() {
+        while it.next().is_some() {
             let index_key = it.key();
             let revision = revision_of(index_key);
             if revision > bound {
@@ -196,6 +205,7 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
             if revision > watermark {
                 lost = revision;
             }
+            let primary_key = &index_key[8..];
             graveyard_rev.delete(index_key);
             graveyard.delete(primary_key);
             removed += 1;
@@ -733,7 +743,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         (resolve(entry, hits), watch)
     }
 
-    fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<Key> {
+    fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<()> {
         entry
             .indexes
             .iter()
@@ -815,6 +825,7 @@ impl<V: Send + Sync + 'static> Table<V> {
                 new_trackers: Vec::new(),
                 lost: entry.lost,
                 primary_key: entry.primary_key,
+                scratch: Vec::new(),
             })
         });
         (&mut **pending as &mut dyn Any)
@@ -839,6 +850,7 @@ impl<V: Send + Sync + 'static> Table<V> {
             revision,
         };
         let old = pending.primary.insert(&key, object);
+        let scratch = &mut pending.scratch;
         for (def, tree) in &mut pending.indexes {
             // Only the difference of the two key sets touches the tree, so an
             // update that keeps a value listed under the same index key leaves
@@ -849,21 +861,25 @@ impl<V: Send + Sync + 'static> Table<V> {
                 .unwrap_or_default();
             let is = sorted((def.keys)(&value));
             for k in was.iter().filter(|k| is.binary_search(k).is_err()) {
-                tree.delete(&index_entry(k, &key));
+                tree.delete(index_entry_into(scratch, k, &key));
             }
             for k in is.iter().filter(|k| was.binary_search(k).is_err()) {
-                tree.insert(&index_entry(k, &key), key.clone());
+                tree.insert(index_entry_into(scratch, k, &key), ());
             }
         }
         if let Some(old) = &old {
-            pending.rev_index.delete(&rev_key(old.revision, &key));
+            pending
+                .rev_index
+                .delete(rev_key_into(&mut pending.scratch, old.revision, &key));
         }
         pending
             .rev_index
-            .insert(&rev_key(revision, &key), key.clone());
+            .insert(rev_key_into(&mut pending.scratch, revision, &key), ());
         // Re-created after a delete: it is live again, so it leaves the graveyard.
         if let Some(dead) = pending.graveyard.delete(&key) {
-            pending.graveyard_rev.delete(&rev_key(dead.revision, &key));
+            pending
+                .graveyard_rev
+                .delete(rev_key_into(&mut pending.scratch, dead.revision, &key));
         }
         old.map(|o| o.value)
     }
@@ -878,12 +894,15 @@ impl<V: Send + Sync + 'static> Table<V> {
         let pending = self.pending(txn);
         let old = pending.primary.delete(key)?;
         pending.written = true;
+        let scratch = &mut pending.scratch;
         for (def, tree) in &mut pending.indexes {
             for k in (def.keys)(&old.value) {
-                tree.delete(&index_entry(&k, key));
+                tree.delete(index_entry_into(scratch, &k, key));
             }
         }
-        pending.rev_index.delete(&rev_key(old.revision, key));
+        pending
+            .rev_index
+            .delete(rev_key_into(&mut pending.scratch, old.revision, key));
         pending.graveyard.insert(
             key,
             Object {
@@ -893,7 +912,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         );
         pending
             .graveyard_rev
-            .insert(&rev_key(revision, key), key.into());
+            .insert(rev_key_into(&mut pending.scratch, revision, key), ());
         txn.dirty = true;
         Some(old.value)
     }
@@ -924,14 +943,17 @@ struct Pending<V> {
     revision: Revision,
     written: bool,
     primary: tree::Txn<Object<V>>,
-    rev_index: tree::Txn<Key>,
+    rev_index: tree::Txn<()>,
     graveyard: tree::Txn<Object<V>>,
-    graveyard_rev: tree::Txn<Key>,
-    indexes: Vec<(Index<V>, tree::Txn<Key>)>,
+    graveyard_rev: tree::Txn<()>,
+    indexes: Vec<(Index<V>, tree::Txn<()>)>,
     trackers: Vec<Weak<AtomicU64>>,
     new_trackers: Vec<Arc<AtomicU64>>,
     lost: Revision,
     primary_key: fn(&V) -> Key,
+    /// Reused by the index key builders, so a write formats its keys without
+    /// allocating one per key.
+    scratch: Vec<u8>,
 }
 
 trait AnyPending: Any {
@@ -1168,9 +1190,9 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
 
 /// One side of the merge: its entries, and the one already taken off it.
 struct Side<'a> {
-    iter: tree::Iter<'a, Key>,
-    /// The next entry's revision, from its index key, and its primary key.
-    taken: Option<(Revision, &'a Key)>,
+    iter: tree::Iter<'a, ()>,
+    /// The next entry's revision, from its index key.
+    taken: Option<Revision>,
 }
 
 /// Merges the live and the deleted entries of `(observed, upper]` by revision.
@@ -1185,10 +1207,10 @@ struct Changes<'a, V> {
 /// lives in the walk, so the entry is taken off the iterator to read it.
 fn peek_revision(side: &mut Side<'_>, upper: Revision) -> Option<Revision> {
     if side.taken.is_none() {
-        let key = side.iter.next()?;
-        side.taken = Some((revision_of(side.iter.key()), key));
+        side.iter.next()?;
+        side.taken = Some(revision_of(side.iter.key()));
     }
-    let (revision, _) = side.taken?;
+    let revision = side.taken?;
     (revision <= upper).then_some(revision)
 }
 
@@ -1211,17 +1233,18 @@ impl<V> Iterator for Changes<'_, V> {
         } else {
             (&self.entry.graveyard, true)
         };
-        let (_, key) = if take_live {
-            self.live.taken.take()
+        let primary = if take_live {
+            self.live.taken.take().expect("peeked");
+            &self.live.iter.key()[8..]
         } else {
-            self.dead.taken.take()
-        }
-        .expect("peeked");
+            self.dead.taken.take().expect("peeked");
+            &self.dead.iter.key()[8..]
+        };
         let object = tree
-            .value(key)
+            .value(primary)
             .expect("revision index disagrees with its tree");
         Some(Change {
-            key: key.clone(),
+            key: primary.into(),
             value: object.value.clone(),
             revision: object.revision,
             deleted,
