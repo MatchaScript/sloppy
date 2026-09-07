@@ -129,14 +129,19 @@ impl<V> Node<V> {
 /// Dropping the last reference to a deep chain must not recurse down it: the
 /// depth is the keys' owner's to pick. Children this node held alone are
 /// unlinked here and dropped one at a time, so each of their drops is shallow.
+///
+/// A child the node shares stays in its slot: its drop is one decrement and
+/// recurses nowhere. A path copy shares all but one child of every node it
+/// rebuilds, so the old node unlinks that one and touches nothing else.
 impl<V> Drop for Node<V> {
     fn drop(&mut self) {
         let mut stack = Vec::new();
-        std::mem::replace(&mut self.children, Children::empty()).drain_into(&mut stack);
+        self.children.unlink_owned(&mut stack);
         while let Some(mut child) = stack.pop() {
-            if let Some(child) = Arc::get_mut(&mut child) {
-                std::mem::replace(&mut child.children, Children::empty()).drain_into(&mut stack);
-            }
+            Arc::get_mut(&mut child)
+                .expect("an unlinked child is held alone")
+                .children
+                .unlink_owned(&mut stack);
         }
     }
 }
@@ -263,89 +268,78 @@ impl<V, const K: usize> Sorted<V, K> {
         }
     }
 
-    /// A copy with `child` filed under `byte`, which must be absent. There
-    /// must be room for it.
-    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
-        let mut this = self.clone();
-        let at = this.find(byte).expect_err("the byte is absent");
-        let end = usize::from(this.len);
-        this.keys[at..=end].rotate_right(1);
-        this.slots[at..=end].rotate_right(1);
-        this.keys[at] = byte;
-        this.slots[at] = Some(child);
-        this.len += 1;
-        this
+    /// Files `child` under `byte`, which must be absent. There must be room
+    /// for it.
+    fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
+        let at = self.find(byte).expect_err("the byte is absent");
+        let end = usize::from(self.len);
+        self.keys[at..=end].rotate_right(1);
+        self.slots[at..=end].rotate_right(1);
+        self.keys[at] = byte;
+        self.slots[at] = Some(child);
+        self.len += 1;
     }
 
-    /// A copy without the child at slot `at`.
-    fn without(&self, at: usize) -> Self {
-        let mut this = self.clone();
-        let end = usize::from(this.len);
-        this.keys[at..end].rotate_left(1);
-        this.slots[at..end].rotate_left(1);
-        this.keys[end - 1] = 0;
-        this.slots[end - 1] = None;
-        this.len -= 1;
-        this
+    /// Removes the child at `byte`, which must be there.
+    fn without(&mut self, byte: u8) {
+        let at = self.find(byte).expect("the child is there");
+        let end = usize::from(self.len);
+        self.keys[at..end].rotate_left(1);
+        self.slots[at..end].rotate_left(1);
+        self.keys[end - 1] = 0;
+        self.slots[end - 1] = None;
+        self.len -= 1;
     }
 }
 
 impl<V> Node48<V> {
-    /// A copy with `child` filed under `byte`, which must be absent. There
-    /// must be room for it.
-    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
-        let mut this = self.clone();
+    /// Files `child` under `byte`, which must be absent. There must be room
+    /// for it.
+    fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
         // The slots stay in key order, so the new one lands after every child
         // below `byte` and the index entries behind it move up.
-        let at = this.index[..usize::from(byte)]
+        let at = self.index[..usize::from(byte)]
             .iter()
             .filter(|slot| **slot != 0)
             .count();
-        let end = usize::from(this.len);
-        this.slots[at..=end].rotate_right(1);
-        for slot in &mut this.index {
+        let end = usize::from(self.len);
+        self.slots[at..=end].rotate_right(1);
+        for slot in &mut self.index {
             if usize::from(*slot) > at {
                 *slot += 1;
             }
         }
-        this.index[usize::from(byte)] = u8::try_from(at + 1).expect("node48 holds 48 slots");
-        this.slots[at] = Some(child);
-        this.len += 1;
-        this
+        self.index[usize::from(byte)] = u8::try_from(at + 1).expect("node48 holds 48 slots");
+        self.slots[at] = Some(child);
+        self.len += 1;
     }
 
-    /// A copy without the child at `byte`, which must be there.
-    fn without(&self, byte: u8) -> Self {
-        let mut this = self.clone();
-        let at = usize::from(this.index[usize::from(byte)] - 1);
-        let end = usize::from(this.len);
-        this.slots[at..end].rotate_left(1);
-        this.slots[end - 1] = None;
-        this.index[usize::from(byte)] = 0;
-        for slot in &mut this.index {
+    /// Removes the child at `byte`, which must be there.
+    fn without(&mut self, byte: u8) {
+        let at = usize::from(self.index[usize::from(byte)] - 1);
+        let end = usize::from(self.len);
+        self.slots[at..end].rotate_left(1);
+        self.slots[end - 1] = None;
+        self.index[usize::from(byte)] = 0;
+        for slot in &mut self.index {
             if usize::from(*slot) > at + 1 {
                 *slot -= 1;
             }
         }
-        this.len -= 1;
-        this
+        self.len -= 1;
     }
 }
 
 impl<V> Node256<V> {
-    /// A copy with `child` filed under `byte`, which must be absent.
-    fn with(&self, byte: u8, child: Arc<Node<V>>) -> Self {
-        let mut this = self.clone();
-        this.slots[usize::from(byte)] = Some(child);
-        this.len += 1;
-        this
+    /// Files `child` under `byte`, which must be absent.
+    fn with(&mut self, byte: u8, child: Arc<Node<V>>) {
+        self.slots[usize::from(byte)] = Some(child);
+        self.len += 1;
     }
 
-    fn without(&self, byte: u8) -> Self {
-        let mut this = self.clone();
-        this.slots[usize::from(byte)] = None;
-        this.len -= 1;
-        this
+    fn without(&mut self, byte: u8) {
+        self.slots[usize::from(byte)] = None;
+        self.len -= 1;
     }
 }
 
@@ -441,6 +435,16 @@ impl<V> Children<V> {
         }
     }
 
+    /// The same slots, for a caller that takes children out of them.
+    fn slots_mut(&mut self) -> &mut [Slot<V>] {
+        match self {
+            Self::N4(s) => &mut s.slots[..usize::from(s.len)],
+            Self::N16(s) => &mut s.slots[..usize::from(s.len)],
+            Self::N48(n) => &mut n.slots[..usize::from(n.len)],
+            Self::N256(n) => &mut n.slots[..],
+        }
+    }
+
     fn iter(&self) -> impl DoubleEndedIterator<Item = &Arc<Node<V>>> {
         self.slots().iter().flatten()
     }
@@ -490,15 +494,16 @@ impl<V> Children<V> {
 
     /// Adds `child` under its own key, which must be absent.
     ///
-    /// Inside one kind this copies the arrays and shifts one position: the keys
-    /// are a memcpy and the slots one `Arc` bump per child, with no child
-    /// dereferenced. Only a count that crosses a kind boundary rebuilds.
-    fn with(&self, child: Arc<Node<V>>) -> Self {
+    /// Inside one kind the arrays shift one position where they sit: the keys
+    /// move by memcpy and the slots by move, so no child is dereferenced and no
+    /// `Arc` count changes. Only a count that crosses a kind boundary rebuilds,
+    /// and that one costs the `Arc` bump per child.
+    fn with(&mut self, child: Arc<Node<V>>) {
         let byte = child.key();
         debug_assert!(self.get(byte).is_none(), "the key is absent");
         if self.len() == self.cap() {
             let (below, above) = self.split(byte);
-            return Self::build(
+            *self = Self::build(
                 self.len() + 1,
                 below
                     .iter()
@@ -507,17 +512,20 @@ impl<V> Children<V> {
                     .chain(iter::once(child))
                     .chain(above.iter().flatten().cloned()),
             );
+            return;
         }
         match self {
-            Self::N4(s) => Self::N4(s.with(byte, child)),
-            Self::N16(s) => Self::N16(Box::new(s.with(byte, child))),
-            Self::N48(n) => Self::N48(Box::new(n.with(byte, child))),
-            Self::N256(n) => Self::N256(Box::new(n.with(byte, child))),
+            Self::N4(s) => s.with(byte, child),
+            Self::N16(s) => s.with(byte, child),
+            Self::N48(n) => n.with(byte, child),
+            Self::N256(n) => n.with(byte, child),
         }
     }
 
     /// Removes the child at `byte`, which must be there.
-    fn without(&self, byte: u8) -> Self {
+    ///
+    /// In place like `with`, except at the count where the kind demotes.
+    fn without(&mut self, byte: u8) {
         let len = self.len();
         let demotes = match self {
             Self::N4(_) => false,
@@ -527,7 +535,7 @@ impl<V> Children<V> {
         };
         if demotes {
             let (below, above) = self.split(byte);
-            return Self::build(
+            *self = Self::build(
                 len - 1,
                 below
                     .iter()
@@ -535,25 +543,37 @@ impl<V> Children<V> {
                     .chain(above.iter().flatten())
                     .cloned(),
             );
+            return;
         }
         match self {
-            Self::N4(s) => Self::N4(s.without(s.find(byte).expect("the child is there"))),
-            Self::N16(s) => Self::N16(Box::new(
-                s.without(s.find(byte).expect("the child is there")),
-            )),
-            Self::N48(n) => Self::N48(Box::new(n.without(byte))),
-            Self::N256(n) => Self::N256(Box::new(n.without(byte))),
+            Self::N4(s) => s.without(byte),
+            Self::N16(s) => s.without(byte),
+            Self::N48(n) => n.without(byte),
+            Self::N256(n) => n.without(byte),
         }
     }
 
-    /// Moves every child into `out`.
-    fn drain_into(self, out: &mut Vec<Arc<Node<V>>>) {
-        match self {
-            Self::N4(s) => out.extend(s.slots.into_iter().flatten()),
-            Self::N16(s) => out.extend(s.slots.into_iter().flatten()),
-            Self::N48(n) => out.extend(n.slots.into_iter().flatten()),
-            Self::N256(n) => out.extend(n.slots.into_iter().flatten()),
-        }
+    /// Moves out every child this node holds alone, leaving the shared ones in
+    /// their slots for the field drop to decrement.
+    ///
+    /// A strong count of one is the whole test, and it is a plain load.
+    /// `Arc::get_mut` proves the same thing by locking the weak count with a
+    /// compare-exchange, which guards against a `Weak` upgrading beside it; no
+    /// `Weak<Node<V>>` is ever created (the crate downgrades an `AtomicU64`
+    /// tracker in `db.rs` and nothing else) and `Node` is private, so nothing
+    /// outside can make one either. The slots belong to a node that is being
+    /// dropped, so no other thread can reach them to clone a child. Keep the
+    /// load: turning it back into `get_mut` buys nothing and costs a
+    /// read-modify-write on every shared child.
+    ///
+    /// The kind's child count is left stale, so this belongs to `Drop`, where
+    /// nothing reads it again.
+    fn unlink_owned(&mut self, out: &mut Vec<Arc<Node<V>>>) {
+        out.extend(
+            self.slots_mut()
+                .iter_mut()
+                .filter_map(|slot| slot.take_if(|child| Arc::strong_count(child) == 1)),
+        );
     }
 
     /// The one child, when that is all there is.
@@ -1024,8 +1044,7 @@ fn insert<V: 'static>(
         // Looked up twice: the loop hands `node` on to the child's slot, which
         // a borrow held across the miss branch would not allow.
         if n.children.get(rest[0]).is_none() {
-            n.children = n
-                .children
+            n.children
                 .with(Node::new(rest, Some(value), Children::empty(), w.id));
             return None;
         }
@@ -1066,7 +1085,7 @@ fn delete<V: 'static>(root: &mut Arc<Node<V>>, key: &[u8], w: &mut Writing) -> A
         let p = Arc::get_mut(&mut parent).expect("owned on the way down");
         *p.children.slot_mut(byte).expect("taken on the way down") = Some(node);
         if gone {
-            p.children = p.children.without(byte);
+            p.children.without(byte);
         }
         node = parent;
         gone = shrink(&mut node, path.is_empty(), w);
