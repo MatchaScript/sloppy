@@ -120,8 +120,7 @@ struct TableEntry<V> {
     graveyard_rev: Tree<Key>,
     /// One tree per registered index, in registration order.
     /// `index_entry(index key, primary key) -> primary key`.
-    indexes: Vec<Tree<Key>>,
-    index_defs: Vec<Index<V>>,
+    indexes: Vec<(Index<V>, Tree<Key>)>,
     trackers: Vec<Weak<AtomicU64>>,
     /// Highest delete revision that [`Db::compact`] removed before every
     /// tracker had seen it. A reader below this has lost a change.
@@ -130,15 +129,14 @@ struct TableEntry<V> {
 }
 
 impl<V> TableEntry<V> {
-    fn new(primary_key: fn(&V) -> Key, index_defs: Vec<Index<V>>) -> Self {
+    fn new(primary_key: fn(&V) -> Key, indexes: Vec<Index<V>>) -> Self {
         Self {
             revision: 0,
             primary: Tree::new(),
             rev_index: Tree::new(),
             graveyard: Tree::new(),
             graveyard_rev: Tree::new(),
-            indexes: vec![Tree::new(); index_defs.len()],
-            index_defs,
+            indexes: indexes.into_iter().map(|def| (def, Tree::new())).collect(),
             trackers: Vec::new(),
             lost: 0,
             primary_key,
@@ -202,7 +200,6 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
             graveyard: graveyard.commit_and_notify(),
             graveyard_rev: graveyard_rev.commit_and_notify(),
             indexes: self.indexes.clone(),
-            index_defs: self.index_defs.clone(),
             trackers,
             lost,
             primary_key: self.primary_key,
@@ -536,12 +533,11 @@ impl<V: Send + Sync + 'static> Table<V> {
     }
 
     fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<Key> {
-        let pos = entry
-            .index_defs
+        entry
+            .indexes
             .iter()
-            .position(|i| i.name == index)
-            .unwrap_or_else(|| panic!("table {} has no index {index}", self.name));
-        &entry.indexes[pos]
+            .find_map(|(def, tree)| (def.name == index).then_some(tree))
+            .unwrap_or_else(|| panic!("table {} has no index {index}", self.name))
     }
 
     /// # Panics
@@ -592,8 +588,11 @@ impl<V: Send + Sync + 'static> Table<V> {
                 rev_index: entry.rev_index.txn(),
                 graveyard: entry.graveyard.txn(),
                 graveyard_rev: entry.graveyard_rev.txn(),
-                indexes: entry.indexes.iter().map(Tree::txn).collect(),
-                index_defs: entry.index_defs.clone(),
+                indexes: entry
+                    .indexes
+                    .iter()
+                    .map(|(def, tree)| (*def, tree.txn()))
+                    .collect(),
                 trackers: entry.trackers.clone(),
                 new_trackers: Vec::new(),
                 lost: entry.lost,
@@ -622,7 +621,7 @@ impl<V: Send + Sync + 'static> Table<V> {
             revision,
         };
         let old = pending.primary.insert(&key, object);
-        for (tree, def) in pending.indexes.iter_mut().zip(&pending.index_defs) {
+        for (def, tree) in &mut pending.indexes {
             // Only the difference of the two key sets touches the tree, so an
             // update that keeps a value listed under the same index key leaves
             // that entry, and the watch over it, alone.
@@ -661,7 +660,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         let pending = self.pending(txn);
         let old = pending.primary.delete(key)?;
         pending.written = true;
-        for (tree, def) in pending.indexes.iter_mut().zip(&pending.index_defs) {
+        for (def, tree) in &mut pending.indexes {
             for k in (def.keys)(&old.value) {
                 tree.delete(&index_entry(&k, key));
             }
@@ -710,8 +709,7 @@ struct Pending<V> {
     rev_index: tree::Txn<Key>,
     graveyard: tree::Txn<Object<V>>,
     graveyard_rev: tree::Txn<Key>,
-    indexes: Vec<tree::Txn<Key>>,
-    index_defs: Vec<Index<V>>,
+    indexes: Vec<(Index<V>, tree::Txn<Key>)>,
     trackers: Vec<Weak<AtomicU64>>,
     new_trackers: Vec<Arc<AtomicU64>>,
     lost: Revision,
@@ -742,10 +740,10 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
         let indexes = this
             .indexes
             .into_iter()
-            .map(|txn| {
+            .map(|(def, txn)| {
                 let (tree, cells) = txn.commit();
                 closed.absorb(cells);
-                tree
+                (def, tree)
             })
             .collect();
         Arc::new(TableEntry {
@@ -757,7 +755,6 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             graveyard: this.graveyard.commit_and_notify(),
             graveyard_rev: this.graveyard_rev.commit_and_notify(),
             indexes,
-            index_defs: this.index_defs,
             trackers,
             lost: this.lost,
             primary_key: this.primary_key,
