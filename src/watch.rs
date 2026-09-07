@@ -60,7 +60,9 @@ impl Cell {
 
 /// What a commit completes once the new root is in place: the cell of a node it
 /// replaced, or the cell of a value it overwrote.
-pub(crate) trait Closes {
+///
+/// `Send + Sync` because a prepared root waits in the `Db`, which is shared.
+pub(crate) trait Closes: Send + Sync {
     fn close(&self);
 }
 

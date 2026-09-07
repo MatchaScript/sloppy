@@ -6,6 +6,7 @@
 //! never block the writer.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -230,13 +231,30 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The database. Registration and writes are serialized by one writer lock;
 /// reads take an `Arc` of the current root and release the lock at once.
+///
+/// The locks are taken in the order `write`, `queue`, `root`; every path takes
+/// a subsequence of that, so none of them cycle.
 pub struct Db {
     root: RwLock<Arc<Root>>,
-    /// The newest prepared root, which [`Db::write`] opens on. Equal to `root`
-    /// while nothing prepared is unpublished.
-    head: Mutex<Arc<Root>>,
+    queue: Mutex<Queue>,
     write: Mutex<()>,
     hook: Mutex<Hook>,
+}
+
+/// The roots that are settled but not visible yet, oldest first. [`Db::write`]
+/// opens on the newest of them, or on the visible root while it is empty.
+struct Queue {
+    unpublished: VecDeque<Unpublished>,
+}
+
+/// A root this `Db` settled that no reader has seen.
+struct Unpublished {
+    root: Arc<Root>,
+    closed: Closed,
+    dirty: bool,
+    /// The change readers the preparing transaction registered, which
+    /// [`Db::abandon`] puts back to unregistered.
+    trackers: Vec<Arc<AtomicU64>>,
 }
 
 type Hook = Box<dyn FnMut(Revision, &ReadTxn) + Send>;
@@ -267,7 +285,9 @@ impl Db {
         });
         Self {
             root: RwLock::new(root.clone()),
-            head: Mutex::new(root),
+            queue: Mutex::new(Queue {
+                unpublished: VecDeque::new(),
+            }),
             write: Mutex::new(()),
             hook: Mutex::new(Box::new(hook)),
         }
@@ -280,21 +300,13 @@ impl Db {
             .clone()
     }
 
-    /// The one place the visible root is replaced. `head` follows unless a
-    /// prepare has already moved it past the root being replaced, so a `table`
-    /// or `compact` between transactions is on the next `write`, and a publish
-    /// leaves the newer prepared root in place.
+    /// The one place the visible root is replaced. The caller holds the queue
+    /// lock, so the roots go visible in the order they were queued.
     fn install(&self, root: Arc<Root>) {
         let old = {
             let mut current = self.root.write().unwrap_or_else(PoisonError::into_inner);
-            std::mem::replace(&mut *current, root.clone())
+            std::mem::replace(&mut *current, root)
         };
-        {
-            let mut head = lock(&self.head);
-            if Arc::ptr_eq(&head, &old) {
-                *head = root;
-            }
-        }
         // A value's destructor may read this Db, so the old root must outlive
         // the root write guard.
         drop(old);
@@ -304,7 +316,8 @@ impl Db {
     ///
     /// # Panics
     ///
-    /// If two indexes have the same name.
+    /// If two indexes have the same name, or a prepared root is unpublished:
+    /// this replaces the visible root, which that one does not build on.
     pub fn table<V: Send + Sync + 'static>(
         &self,
         name: &'static str,
@@ -319,12 +332,18 @@ impl Db {
                 index.name
             );
         }
+        let queue = lock(&self.queue);
+        assert!(
+            queue.unpublished.is_empty(),
+            "table registered with a prepared root still unpublished"
+        );
         let mut root = (*self.snapshot()).clone();
         let pos = root.tables.len();
         root.tables
             .push(Arc::new(TableEntry::new(primary_key, indexes.to_vec())));
         let db = root.db;
         self.install(Arc::new(root));
+        drop(queue);
         Table {
             db,
             pos,
@@ -343,7 +362,10 @@ impl Db {
     #[must_use]
     pub fn write(&self) -> WriteTxn<'_> {
         let guard = lock(&self.write);
-        let root = lock(&self.head).clone();
+        let root = lock(&self.queue)
+            .unpublished
+            .back()
+            .map_or_else(|| self.snapshot(), |u| u.root.clone());
         let pending = std::iter::repeat_with(|| None)
             .take(root.tables.len())
             .collect();
@@ -361,8 +383,18 @@ impl Db {
     ///
     /// This is not history: it does not bump the revision and does not run the
     /// commit hook.
+    ///
+    /// # Panics
+    ///
+    /// If a prepared root is unpublished: this replaces the visible root, which
+    /// that one does not build on.
     pub fn compact(&self, rev: Revision) {
         let _guard = lock(&self.write);
+        let queue = lock(&self.queue);
+        assert!(
+            queue.unpublished.is_empty(),
+            "compact with a prepared root still unpublished"
+        );
         let mut root = (*self.snapshot()).clone();
         root.compacted = rev.min(root.revision).max(root.compacted);
         for table in &mut root.tables {
@@ -371,44 +403,55 @@ impl Db {
             }
         }
         self.install(Arc::new(root));
+        drop(queue);
     }
 
-    /// Makes a prepared root visible and returns its revision.
+    /// Makes the oldest unpublished root visible and returns its revision. The
+    /// queue is the order, so there is none for the caller to get wrong.
     ///
     /// # Panics
     ///
-    /// If `p` is not prepared on the visible root, which is what publishing out
-    /// of the order the roots were prepared in looks like. Also propagates a
-    /// panic from the commit hook.
-    pub fn publish(&self, p: Prepared) -> Revision {
-        let Prepared {
-            parent,
-            root,
-            closed,
-            dirty,
-        } = p;
-        assert!(
-            Arc::ptr_eq(&self.snapshot(), &parent),
-            "published a root prepared on an older one"
-        );
-        let revision = root.revision;
-        self.install(root.clone());
-        closed.close();
-        if dirty {
-            let txn = ReadTxn(root);
+    /// If nothing is prepared. Also propagates a panic from the commit hook.
+    // The revision is worth ignoring; making the root visible is the point.
+    #[allow(clippy::must_use_candidate)]
+    pub fn publish(&self) -> Revision {
+        let next = {
+            let mut queue = lock(&self.queue);
+            let next = queue
+                .unpublished
+                .pop_front()
+                .expect("publish with nothing prepared");
+            // Installing under the queue lock puts the roots in front of the
+            // readers in the order they were popped in. Closing the cells and
+            // running the hook stays outside it, so it holds up no later
+            // prepare.
+            self.install(next.root.clone());
+            drop(queue);
+            next
+        };
+        let revision = next.root.revision;
+        next.closed.close();
+        if next.dirty {
+            let txn = ReadTxn(next.root);
             lock(&self.hook)(revision, &txn);
         }
         revision
     }
 
-    /// Drops a prepared root and puts `head` back on the one it was built on.
-    /// Nothing ever saw it, so none of its cells are closed.
+    /// Drops every unpublished root, so the next [`Db::write`] opens on the
+    /// visible one. Nothing ever saw them, so none of their cells are closed,
+    /// and the change readers they registered go back to unregistered.
     ///
     /// The writer lock is not reentrant: an open [`WriteTxn`] must be dropped
     /// first.
-    pub fn abandon(&self, p: Prepared) {
+    pub fn abandon(&self) {
         let _guard = lock(&self.write);
-        *lock(&self.head) = p.parent;
+        let mut queue = lock(&self.queue);
+        for dropped in queue.unpublished.drain(..) {
+            for tracker in dropped.trackers {
+                tracker.store(UNREGISTERED, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -894,12 +937,24 @@ struct Pending<V> {
 
 trait AnyPending: Any {
     /// Builds the new table entry. `closed` collects the cells of the primary
-    /// tree, which the caller closes once the new root is in place.
-    fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable>;
+    /// tree, which the caller closes once the new root is in place, and
+    /// `registered` the change readers this table opened, which the caller puts
+    /// back to unregistered if the root is abandoned.
+    fn install(
+        self: Box<Self>,
+        revision: Revision,
+        closed: &mut Closed,
+        registered: &mut Vec<Arc<AtomicU64>>,
+    ) -> Arc<dyn AnyTable>;
 }
 
 impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
-    fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable> {
+    fn install(
+        self: Box<Self>,
+        revision: Revision,
+        closed: &mut Closed,
+        registered: &mut Vec<Arc<AtomicU64>>,
+    ) -> Arc<dyn AnyTable> {
         let this = *self;
         let revision = if this.written {
             revision
@@ -907,9 +962,10 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             this.revision
         };
         let mut trackers = this.trackers;
-        for tracker in &this.new_trackers {
+        for tracker in this.new_trackers {
             tracker.store(revision, Ordering::Relaxed);
-            trackers.push(Arc::downgrade(tracker));
+            trackers.push(Arc::downgrade(&tracker));
+            registered.push(tracker);
         }
         let (primary, cells) = this.primary.commit();
         closed.absorb(cells);
@@ -950,22 +1006,13 @@ pub struct WriteTxn<'a> {
     dirty: bool,
 }
 
-/// A root this transaction settled but no reader has seen. Stays on the thread
-/// that prepared it: `Closed` holds cells that are neither `Send` nor `Sync`.
-pub struct Prepared {
-    /// The root this one was built on, which [`Db::publish`] checks is still
-    /// the visible one.
-    parent: Arc<Root>,
-    root: Arc<Root>,
-    closed: Closed,
-    dirty: bool,
-}
-
-impl WriteTxn<'_> {
-    /// Settles the trees, moves `head` onto the new root and releases the
-    /// writer lock. Nothing is visible until [`Db::publish`].
-    #[must_use]
-    pub fn prepare(self) -> Prepared {
+impl<'a> WriteTxn<'a> {
+    /// Settles the trees and puts the new root at the end of the queue, keeping
+    /// the writer lock: `prepare` drops the guard, `commit` publishes under it.
+    ///
+    /// A transaction that touched no table queues the root it opened on, so
+    /// prepare and publish stay one for one.
+    fn settle(self) -> (&'a Db, MutexGuard<'a, ()>, Revision) {
         let WriteTxn {
             db,
             _guard: guard,
@@ -973,45 +1020,53 @@ impl WriteTxn<'_> {
             pending,
             dirty,
         } = self;
-        if pending.iter().all(Option::is_none) {
-            return Prepared {
-                root: parent.clone(),
-                parent,
-                closed: Closed::default(),
-                dirty: false,
-            };
-        }
-        let mut root = (*parent).clone();
-        let revision = root.revision + Revision::from(dirty);
         let mut closed = Closed::default();
-        for (pos, table) in pending.into_iter().enumerate() {
-            if let Some(table) = table {
-                root.tables[pos] = table.install(revision, &mut closed);
+        let mut trackers = Vec::new();
+        let root = if pending.iter().all(Option::is_none) {
+            parent
+        } else {
+            let mut root = (*parent).clone();
+            let revision = root.revision + Revision::from(dirty);
+            for (pos, table) in pending.into_iter().enumerate() {
+                if let Some(table) = table {
+                    root.tables[pos] = table.install(revision, &mut closed, &mut trackers);
+                }
             }
-        }
-        // ponytail: every commit walks every table's graveyard, which costs one
-        // empty iteration per untouched table. Track the tables with a
-        // non-empty graveyard in the root if the table count ever grows.
-        for table in &mut root.tables {
-            if let Some(new) = table.collect(root.compacted) {
-                *table = new;
+            // ponytail: every commit walks every table's graveyard, which costs
+            // one empty iteration per untouched table. Track the tables with a
+            // non-empty graveyard in the root if the table count ever grows.
+            for table in &mut root.tables {
+                if let Some(new) = table.collect(root.compacted) {
+                    *table = new;
+                }
             }
-        }
-        root.revision = revision;
+            root.revision = revision;
+            Arc::new(root)
+        };
 
-        let root = Arc::new(root);
-        *lock(&db.head) = root.clone();
-        drop(guard);
-        Prepared {
-            parent,
+        let revision = root.revision;
+        lock(&db.queue).unpublished.push_back(Unpublished {
             root,
             closed,
             dirty,
-        }
+            trackers,
+        });
+        (db, guard, revision)
     }
 
-    /// Installs the new root and returns its revision, which is the previous
-    /// one if nothing was written.
+    /// Settles the trees, queues the new root and releases the writer lock.
+    /// Nothing is visible until [`Db::publish`], which the caller owes the `Db`
+    /// once for every prepare.
+    // The revision is worth ignoring; queueing the root is the point.
+    #[allow(clippy::must_use_candidate)]
+    pub fn prepare(self) -> Revision {
+        let (_, guard, revision) = self.settle();
+        drop(guard);
+        revision
+    }
+
+    /// Settles and publishes under the writer lock, and returns the new
+    /// revision, which is the previous one if nothing was written.
     ///
     /// # Panics
     ///
@@ -1020,8 +1075,14 @@ impl WriteTxn<'_> {
     // The revision is worth ignoring; the commit itself is the point.
     #[allow(clippy::must_use_candidate)]
     pub fn commit(self) -> Revision {
-        let db = self.db;
-        db.publish(self.prepare())
+        assert!(
+            lock(&self.db.queue).unpublished.is_empty(),
+            "commit with a prepared root still unpublished"
+        );
+        let (db, guard, _) = self.settle();
+        let revision = db.publish();
+        drop(guard);
+        revision
     }
 }
 
