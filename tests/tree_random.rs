@@ -32,7 +32,7 @@ impl Lcg {
 fn walked(mut it: Iter<'_, u64>) -> Vec<(Vec<u8>, u64)> {
     let mut out = Vec::new();
     while let Some(v) = it.next() {
-        out.push((it.key().to_vec(), **v));
+        out.push((it.key().to_vec(), *v));
     }
     out
 }
@@ -62,19 +62,19 @@ fn matches_btreemap() {
             let key = rng.key();
             touched.push(key.clone());
             if rng.below(3) == 0 {
-                let gone = txn.delete(&key).map(|v| *v);
+                let gone = txn.delete(&key);
                 assert_eq!(gone, model.remove(&key), "delete {key:?}");
                 hit_deletes += usize::from(gone.is_some());
             } else {
                 stamp += 1;
                 assert_eq!(
-                    txn.insert(&key, stamp).map(|v| *v),
+                    txn.insert(&key, stamp),
                     model.insert(key.clone(), stamp),
                     "insert {key:?}"
                 );
             }
             // The txn must see its own earlier writes.
-            assert_eq!(txn.get(&key).map(|v| **v), model.get(&key).copied());
+            assert_eq!(txn.get(&key).copied(), model.get(&key).copied());
             ops += 1;
         }
 
@@ -98,8 +98,8 @@ fn matches_btreemap() {
             // txn was opened on.
             if !touched.contains(&key) {
                 assert_eq!(
-                    txn.get(&key).map(|v| **v),
-                    tree.value(&key).map(|v| **v),
+                    txn.get(&key).copied(),
+                    tree.value(&key).copied(),
                     "untouched {key:?}"
                 );
             }
@@ -115,7 +115,7 @@ fn matches_btreemap() {
         for _ in 0..4 {
             let key = rng.key();
             assert_eq!(
-                tree.get(&key).0.map(|v| **v),
+                tree.get(&key).0.copied(),
                 model.get(&key).copied(),
                 "get {key:?}"
             );
@@ -280,11 +280,7 @@ async fn a_watch_taken_after_the_change_is_already_closed() {
     let t1 = txn.commit_and_notify();
 
     let (value, mut late) = t0.get(b"a");
-    assert_eq!(
-        value.map(|v| **v),
-        Some(1),
-        "the old snapshot still reads 1"
-    );
+    assert_eq!(value.copied(), Some(1), "the old snapshot still reads 1");
     assert!(late.is_closed());
     late.changed().await;
 

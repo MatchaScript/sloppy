@@ -25,6 +25,17 @@ struct Object<V> {
     revision: Revision,
 }
 
+/// The tree holds the object inline and clones it on a path copy, which is one
+/// `Arc` bump. Derived would ask for `V: Clone`, which no table needs.
+impl<V> Clone for Object<V> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            revision: self.revision,
+        }
+    }
+}
+
 /// Key of the revision indexes: the revision, big-endian, then the primary key.
 ///
 /// `StateDB` gives every object its own revision, so the revision alone is a
@@ -43,7 +54,7 @@ fn revision_of(rev_key: &[u8]) -> Revision {
     Revision::from_be_bytes(head)
 }
 
-fn row<V>(obj: &Arc<Object<V>>) -> (&V, Revision) {
+fn row<V>(obj: &Object<V>) -> (&V, Revision) {
     (obj.value.as_ref(), obj.revision)
 }
 
@@ -492,11 +503,7 @@ impl ReadTxn {
 /// The trait hands back the results rather than the tree they came from, which
 /// keeps `tree::Node` and the two tree types out of its signature.
 trait Snapshot {
-    fn value<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        key: &[u8],
-    ) -> Option<&Arc<Object<V>>>;
+    fn value<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<&Object<V>>;
 
     fn prefix<V: Send + Sync + 'static>(
         &self,
@@ -514,11 +521,7 @@ trait Snapshot {
 }
 
 impl Snapshot for ReadTxn {
-    fn value<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        key: &[u8],
-    ) -> Option<&Arc<Object<V>>> {
+    fn value<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<&Object<V>> {
         table.entry(&self.0).primary.value(key)
     }
 
@@ -547,11 +550,7 @@ impl Snapshot for ReadTxn {
 /// writes are there; every other table reads the root the transaction opened
 /// on. Reading opens no slot.
 impl Snapshot for WriteTxn<'_> {
-    fn value<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        key: &[u8],
-    ) -> Option<&Arc<Object<V>>> {
+    fn value<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<&Object<V>> {
         match table.opened(self) {
             Some(pending) => pending.primary.get(key),
             None => table.entry(&self.root).primary.value(key),
@@ -866,7 +865,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         if let Some(dead) = pending.graveyard.delete(&key) {
             pending.graveyard_rev.delete(&rev_key(dead.revision, &key));
         }
-        old.map(|o| o.value.clone())
+        old.map(|o| o.value)
     }
 
     /// Moves the entry to the graveyard and returns it.
@@ -896,7 +895,7 @@ impl<V: Send + Sync + 'static> Table<V> {
             .graveyard_rev
             .insert(&rev_key(revision, key), key.into());
         txn.dirty = true;
-        Some(old.value.clone())
+        Some(old.value)
     }
 
     /// Registers a change reader that observes this table as of the commit that
@@ -1171,7 +1170,7 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
 struct Side<'a> {
     iter: tree::Iter<'a, Key>,
     /// The next entry's revision, from its index key, and its primary key.
-    taken: Option<(Revision, &'a Arc<Key>)>,
+    taken: Option<(Revision, &'a Key)>,
 }
 
 /// Merges the live and the deleted entries of `(observed, upper]` by revision.
@@ -1222,7 +1221,7 @@ impl<V> Iterator for Changes<'_, V> {
             .value(key)
             .expect("revision index disagrees with its tree");
         Some(Change {
-            key: (**key).clone(),
+            key: key.clone(),
             value: object.value.clone(),
             revision: object.revision,
             deleted,
