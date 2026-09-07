@@ -64,9 +64,9 @@ fn snapshots_hold_their_version() {
     assert_eq!(
         items
             .prefix(&after, b"b")
-            .map(|(k, _, _)| k)
+            .map(|(v, _)| v.key)
             .collect::<Vec<_>>(),
-        vec![b"b".to_vec()]
+        vec!["b"]
     );
     assert_eq!(items.lower_bound(&after, b"b").count(), 1);
 }
@@ -102,13 +102,9 @@ fn a_write_txn_reads_its_own_writes() {
     assert_eq!(
         items
             .lower_bound(&w, b"a")
-            .map(|(k, v, r)| (k, v.val, r))
+            .map(|(v, r)| (v.key, v.val, r))
             .collect::<Vec<_>>(),
-        vec![
-            (b"b".to_vec(), 2, 2),
-            (b"c".to_vec(), 2, 2),
-            (b"d".to_vec(), 1, 1),
-        ]
+        vec![("b", 2, 2), ("c", 2, 2), ("d", 1, 1)]
     );
     assert_eq!(items.prefix(&w, b"c").count(), 1);
     assert_eq!(items.all(&w).count(), 3);
@@ -668,7 +664,7 @@ fn row(key: &'static str, tenants: &'static [&'static str]) -> Row {
 /// The primary keys listed under `tenant`.
 fn by_tenant(db: &Db, rows: Table<Row>, tenant: &str) -> Vec<String> {
     rows.by_index(&db.read(), "tenant", tenant.as_bytes())
-        .map(|(k, _, _)| String::from_utf8(k).unwrap())
+        .map(|(v, _)| v.key.to_string())
         .collect()
 }
 
@@ -693,7 +689,7 @@ fn two_indexes_on_one_table_stay_independent() {
     w.commit();
     let list = |index: &'static str, key: &str| -> Vec<String> {
         rows.by_index(&db.read(), index, key.as_bytes())
-            .map(|(k, _, _)| String::from_utf8(k).unwrap())
+            .map(|(v, _)| v.key.to_string())
             .collect()
     };
     assert_eq!(list("tenant", "a"), ["r1", "s1"]);
@@ -748,7 +744,7 @@ fn an_index_follows_the_values_it_covers() {
     let r = db.read();
     let listed: Vec<_> = rows
         .by_index(&r, "tenant", b"a")
-        .map(|(_, v, rev)| (v.key, rev))
+        .map(|(v, rev)| (v.key, rev))
         .collect();
     assert_eq!(listed, [("r2", 1)]);
 }

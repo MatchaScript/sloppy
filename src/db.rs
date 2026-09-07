@@ -8,7 +8,6 @@
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
-use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
@@ -43,21 +42,21 @@ fn revision_of(rev_key: &[u8]) -> Revision {
     Revision::from_be_bytes(head)
 }
 
-fn row<V>((key, obj): (Vec<u8>, &Arc<Object<V>>)) -> (Vec<u8>, &V, Revision) {
-    (key, obj.value.as_ref(), obj.revision)
+fn row<V>(obj: &Arc<Object<V>>) -> (&V, Revision) {
+    (obj.value.as_ref(), obj.revision)
 }
 
-/// Resolves index hits (index key, primary key) through the primary tree.
+/// Resolves index hits (the primary keys they list) through the primary tree.
 fn resolve<'a, V>(
     entry: &'a TableEntry<V>,
     hits: tree::Iter<'a, Key>,
-) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-    hits.map(move |(_, primary)| {
+) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V> {
+    hits.map(move |primary| {
         let object = entry
             .primary
             .value(primary)
             .expect("index disagrees with the primary tree");
-        (primary.to_vec(), object.value.as_ref(), object.revision)
+        (object.value.as_ref(), object.revision)
     })
 }
 
@@ -175,15 +174,17 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
         let mut graveyard_rev = self.graveyard_rev.txn();
         let mut removed = 0usize;
         let mut lost = self.lost;
-        for (index_key, primary_key) in self.graveyard_rev.iter() {
-            let revision = revision_of(&index_key);
+        let mut it = self.graveyard_rev.iter();
+        while let Some(primary_key) = it.next() {
+            let index_key = it.key();
+            let revision = revision_of(index_key);
             if revision > bound {
                 break;
             }
             if revision > watermark {
                 lost = revision;
             }
-            graveyard_rev.delete(&index_key);
+            graveyard_rev.delete(index_key);
             graveyard.delete(primary_key);
             removed += 1;
         }
@@ -605,7 +606,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         &self,
         txn: &'a S,
         prefix: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V, S> {
         txn.prefix(self, prefix).map(row)
     }
 
@@ -616,10 +617,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         &self,
         txn: &'a ReadTxn,
         prefix: &[u8],
-    ) -> (
-        impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V>,
-        Watch,
-    ) {
+    ) -> (impl Iterator<Item = (&'a V, Revision)> + use<'a, V>, Watch) {
         let (iter, watch) = self.entry(&txn.0).primary.prefix_watch(prefix);
         (iter.map(row), watch)
     }
@@ -637,7 +635,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         &self,
         txn: &'a S,
         key: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V, S> {
         txn.lower_bound(self, key).map(row)
     }
 
@@ -651,10 +649,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         &self,
         txn: &'a ReadTxn,
         key: &[u8],
-    ) -> (
-        impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V>,
-        Watch,
-    ) {
+    ) -> (impl Iterator<Item = (&'a V, Revision)> + use<'a, V>, Watch) {
         let (iter, watch) = self.entry(&txn.0).primary.lower_bound_watch(key);
         (iter.map(row), watch)
     }
@@ -670,7 +665,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         txn: &'a ReadTxn,
         index: &'static str,
         key: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
+    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V> {
         let entry = self.entry(&txn.0);
         let hits = self.index_tree(entry, index).prefix(&index_prefix(key));
         resolve(entry, hits)
@@ -688,10 +683,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         txn: &'a ReadTxn,
         index: &'static str,
         key: &[u8],
-    ) -> (
-        impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V>,
-        Watch,
-    ) {
+    ) -> (impl Iterator<Item = (&'a V, Revision)> + use<'a, V>, Watch) {
         let entry = self.entry(&txn.0);
         let (hits, watch) = self
             .index_tree(entry, index)
@@ -717,7 +709,7 @@ impl<V: Send + Sync + 'static> Table<V> {
     pub fn all<'a, S: Snapshot>(
         &self,
         txn: &'a S,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V, S> {
         txn.all(self).map(row)
     }
 
@@ -729,10 +721,7 @@ impl<V: Send + Sync + 'static> Table<V> {
     pub fn all_watch<'a>(
         &self,
         txn: &'a ReadTxn,
-    ) -> (
-        impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V>,
-        Watch,
-    ) {
+    ) -> (impl Iterator<Item = (&'a V, Revision)> + use<'a, V>, Watch) {
         let entry = self.entry(&txn.0);
         (entry.primary.iter().map(row), entry.primary.root_watch())
     }
@@ -1100,8 +1089,14 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
         }
         let from = observed.saturating_add(1).to_be_bytes();
         let changes = Changes {
-            live: entry.rev_index.lower_bound(&from).peekable(),
-            dead: entry.graveyard_rev.lower_bound(&from).peekable(),
+            live: Side {
+                iter: entry.rev_index.lower_bound(&from),
+                taken: None,
+            },
+            dead: Side {
+                iter: entry.graveyard_rev.lower_bound(&from),
+                taken: None,
+            },
             entry,
             upper: entry.revision,
         };
@@ -1111,16 +1106,29 @@ impl<V: Send + Sync + 'static> ChangeIterator<V> {
     }
 }
 
+/// One side of the merge: its entries, and the one already taken off it.
+struct Side<'a> {
+    iter: tree::Iter<'a, Key>,
+    /// The next entry's revision, from its index key, and its primary key.
+    taken: Option<(Revision, &'a Arc<Key>)>,
+}
+
 /// Merges the live and the deleted entries of `(observed, upper]` by revision.
 struct Changes<'a, V> {
-    live: Peekable<tree::Iter<'a, Key>>,
-    dead: Peekable<tree::Iter<'a, Key>>,
+    live: Side<'a>,
+    dead: Side<'a>,
     entry: &'a TableEntry<V>,
     upper: Revision,
 }
 
-fn peek_revision(iter: &mut Peekable<tree::Iter<'_, Key>>, upper: Revision) -> Option<Revision> {
-    let revision = revision_of(&iter.peek()?.0);
+/// The revision of the side's next entry, if it is in range. The index key
+/// lives in the walk, so the entry is taken off the iterator to read it.
+fn peek_revision(side: &mut Side<'_>, upper: Revision) -> Option<Revision> {
+    if side.taken.is_none() {
+        let key = side.iter.next()?;
+        side.taken = Some((revision_of(side.iter.key()), key));
+    }
+    let (revision, _) = side.taken?;
     (revision <= upper).then_some(revision)
 }
 
@@ -1144,9 +1152,9 @@ impl<V> Iterator for Changes<'_, V> {
             (&self.entry.graveyard, true)
         };
         let (_, key) = if take_live {
-            self.live.next()
+            self.live.taken.take()
         } else {
-            self.dead.next()
+            self.dead.taken.take()
         }
         .expect("peeked");
         let object = tree
