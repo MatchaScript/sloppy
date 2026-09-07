@@ -6,7 +6,6 @@
 //! transaction already rebuilt is mutated in place instead, which is what the
 //! `txn` stamp is for.
 
-use std::array;
 use std::cmp::Ordering;
 use std::iter;
 use std::ops::Deref;
@@ -199,7 +198,7 @@ impl<V, const K: usize> Clone for Sorted<V, K> {
     fn clone(&self) -> Self {
         Self {
             keys: self.keys,
-            slots: array::from_fn(|i| self.slots[i].clone()),
+            slots: self.slots.clone(),
             len: self.len,
         }
     }
@@ -209,7 +208,7 @@ impl<V> Clone for Node48<V> {
     fn clone(&self) -> Self {
         Self {
             index: self.index,
-            slots: array::from_fn(|i| self.slots[i].clone()),
+            slots: self.slots.clone(),
             len: self.len,
         }
     }
@@ -218,7 +217,7 @@ impl<V> Clone for Node48<V> {
 impl<V> Clone for Node256<V> {
     fn clone(&self) -> Self {
         Self {
-            slots: array::from_fn(|i| self.slots[i].clone()),
+            slots: self.slots.clone(),
             len: self.len,
         }
     }
@@ -228,7 +227,7 @@ impl<V, const K: usize> Sorted<V, K> {
     fn fill(children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
         let mut this = Self {
             keys: [0; K],
-            slots: array::from_fn(|_| None),
+            slots: [const { None }; K],
             len: 0,
         };
         for child in children {
@@ -367,7 +366,7 @@ impl<V> Children<V> {
             17..=48 => {
                 let mut this = Node48 {
                     index: [0; 256],
-                    slots: array::from_fn(|_| None),
+                    slots: [const { None }; 48],
                     len: 0,
                 };
                 for child in children {
@@ -379,7 +378,7 @@ impl<V> Children<V> {
             }
             _ => {
                 let mut this = Node256 {
-                    slots: array::from_fn(|_| None),
+                    slots: [const { None }; 256],
                     len: 0,
                 };
                 for child in children {

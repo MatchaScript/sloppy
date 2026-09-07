@@ -120,8 +120,7 @@ struct TableEntry<V> {
     graveyard_rev: Tree<Key>,
     /// One tree per registered index, in registration order.
     /// `index_entry(index key, primary key) -> primary key`.
-    indexes: Vec<Tree<Key>>,
-    index_defs: Vec<Index<V>>,
+    indexes: Vec<(Index<V>, Tree<Key>)>,
     trackers: Vec<Weak<AtomicU64>>,
     /// Highest delete revision that [`Db::compact`] removed before every
     /// tracker had seen it. A reader below this has lost a change.
@@ -130,15 +129,14 @@ struct TableEntry<V> {
 }
 
 impl<V> TableEntry<V> {
-    fn new(primary_key: fn(&V) -> Key, index_defs: Vec<Index<V>>) -> Self {
+    fn new(primary_key: fn(&V) -> Key, indexes: Vec<Index<V>>) -> Self {
         Self {
             revision: 0,
             primary: Tree::new(),
             rev_index: Tree::new(),
             graveyard: Tree::new(),
             graveyard_rev: Tree::new(),
-            indexes: vec![Tree::new(); index_defs.len()],
-            index_defs,
+            indexes: indexes.into_iter().map(|def| (def, Tree::new())).collect(),
             trackers: Vec::new(),
             lost: 0,
             primary_key,
@@ -148,19 +146,13 @@ impl<V> TableEntry<V> {
 
 /// The type-erased face of `TableEntry<V>`: what the `Root` can do without
 /// knowing the value type.
-trait AnyTable: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
+trait AnyTable: Any + Send + Sync {
     /// Drops dead trackers and every graveyard object at or below the
     /// watermark. `None` means nothing changed.
     fn collect(&self, compacted: Revision) -> Option<Arc<dyn AnyTable>>;
 }
 
 impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn collect(&self, compacted: Revision) -> Option<Arc<dyn AnyTable>> {
         let mut trackers = Vec::with_capacity(self.trackers.len());
         let mut watermark = Revision::MAX;
@@ -208,7 +200,6 @@ impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
             graveyard: graveyard.commit_and_notify(),
             graveyard_rev: graveyard_rev.commit_and_notify(),
             indexes: self.indexes.clone(),
-            index_defs: self.index_defs.clone(),
             trackers,
             lost,
             primary_key: self.primary_key,
@@ -403,7 +394,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         root.tables
             .get(self.pos)
             .filter(|_| root.db == self.db)
-            .and_then(|t| t.as_any().downcast_ref())
+            .and_then(|t| (&**t as &dyn Any).downcast_ref())
             .unwrap_or_else(|| panic!("table {} belongs to another Db or value type", self.name))
     }
 
@@ -542,12 +533,11 @@ impl<V: Send + Sync + 'static> Table<V> {
     }
 
     fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<Key> {
-        let pos = entry
-            .index_defs
+        entry
+            .indexes
             .iter()
-            .position(|i| i.name == index)
-            .unwrap_or_else(|| panic!("table {} has no index {index}", self.name));
-        &entry.indexes[pos]
+            .find_map(|(def, tree)| (def.name == index).then_some(tree))
+            .unwrap_or_else(|| panic!("table {} has no index {index}", self.name))
     }
 
     /// # Panics
@@ -590,27 +580,26 @@ impl<V: Send + Sync + 'static> Table<V> {
     /// The working copy of this table, opened on first use.
     fn pending<'t>(&self, txn: &'t mut WriteTxn<'_>) -> &'t mut Pending<V> {
         let entry = self.entry(&txn.root);
-        if txn.pending[self.pos].is_none() {
-            let pending = Pending {
+        let pending = txn.pending[self.pos].get_or_insert_with(|| {
+            Box::new(Pending {
                 revision: entry.revision,
                 written: false,
                 primary: entry.primary.txn(),
                 rev_index: entry.rev_index.txn(),
                 graveyard: entry.graveyard.txn(),
                 graveyard_rev: entry.graveyard_rev.txn(),
-                indexes: entry.indexes.iter().map(Tree::txn).collect(),
-                index_defs: entry.index_defs.clone(),
+                indexes: entry
+                    .indexes
+                    .iter()
+                    .map(|(def, tree)| (*def, tree.txn()))
+                    .collect(),
                 trackers: entry.trackers.clone(),
                 new_trackers: Vec::new(),
                 lost: entry.lost,
                 primary_key: entry.primary_key,
-            };
-            txn.pending[self.pos] = Some(Box::new(pending));
-        }
-        txn.pending[self.pos]
-            .as_mut()
-            .expect("just opened")
-            .as_any_mut()
+            })
+        });
+        (&mut **pending as &mut dyn Any)
             .downcast_mut()
             .expect("pending table opened with another value type")
     }
@@ -632,7 +621,7 @@ impl<V: Send + Sync + 'static> Table<V> {
             revision,
         };
         let old = pending.primary.insert(&key, object);
-        for (tree, def) in pending.indexes.iter_mut().zip(&pending.index_defs) {
+        for (def, tree) in &mut pending.indexes {
             // Only the difference of the two key sets touches the tree, so an
             // update that keeps a value listed under the same index key leaves
             // that entry, and the watch over it, alone.
@@ -671,7 +660,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         let pending = self.pending(txn);
         let old = pending.primary.delete(key)?;
         pending.written = true;
-        for (tree, def) in pending.indexes.iter_mut().zip(&pending.index_defs) {
+        for (def, tree) in &mut pending.indexes {
             for k in (def.keys)(&old.value) {
                 tree.delete(&index_entry(&k, key));
             }
@@ -720,20 +709,17 @@ struct Pending<V> {
     rev_index: tree::Txn<Key>,
     graveyard: tree::Txn<Object<V>>,
     graveyard_rev: tree::Txn<Key>,
-    indexes: Vec<tree::Txn<Key>>,
-    index_defs: Vec<Index<V>>,
+    indexes: Vec<(Index<V>, tree::Txn<Key>)>,
     trackers: Vec<Weak<AtomicU64>>,
     new_trackers: Vec<Arc<AtomicU64>>,
     lost: Revision,
     primary_key: fn(&V) -> Key,
 }
 
-trait AnyPending {
+trait AnyPending: Any {
     /// Builds the new table entry. `closed` collects the cells of the primary
     /// tree, which the caller closes once the new root is in place.
     fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable>;
-
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
@@ -754,10 +740,10 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
         let indexes = this
             .indexes
             .into_iter()
-            .map(|txn| {
+            .map(|(def, txn)| {
                 let (tree, cells) = txn.commit();
                 closed.absorb(cells);
-                tree
+                (def, tree)
             })
             .collect();
         Arc::new(TableEntry {
@@ -769,16 +755,12 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             graveyard: this.graveyard.commit_and_notify(),
             graveyard_rev: this.graveyard_rev.commit_and_notify(),
             indexes,
-            index_defs: this.index_defs,
             trackers,
             lost: this.lost,
             primary_key: this.primary_key,
         })
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
 /// The write transaction. Dropping it aborts: nothing was ever visible.
