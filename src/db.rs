@@ -231,6 +231,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// reads take an `Arc` of the current root and release the lock at once.
 pub struct Db {
     root: RwLock<Arc<Root>>,
+    /// The newest prepared root, which [`Db::write`] opens on. Equal to `root`
+    /// while nothing prepared is unpublished.
+    head: Mutex<Arc<Root>>,
     write: Mutex<()>,
     hook: Mutex<Hook>,
 }
@@ -255,13 +258,15 @@ impl Db {
     /// of `commit`.
     pub fn with_hook(hook: impl FnMut(Revision, &ReadTxn) + Send + 'static) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let root = Arc::new(Root {
+            db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            revision: 0,
+            compacted: 0,
+            tables: Vec::new(),
+        });
         Self {
-            root: RwLock::new(Arc::new(Root {
-                db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                revision: 0,
-                compacted: 0,
-                tables: Vec::new(),
-            })),
+            root: RwLock::new(root.clone()),
+            head: Mutex::new(root),
             write: Mutex::new(()),
             hook: Mutex::new(Box::new(hook)),
         }
@@ -274,11 +279,21 @@ impl Db {
             .clone()
     }
 
+    /// The one place the visible root is replaced. `head` follows unless a
+    /// prepare has already moved it past the root being replaced, so a `table`
+    /// or `compact` between transactions is on the next `write`, and a publish
+    /// leaves the newer prepared root in place.
     fn install(&self, root: Arc<Root>) {
         let old = {
             let mut current = self.root.write().unwrap_or_else(PoisonError::into_inner);
-            std::mem::replace(&mut *current, root)
+            std::mem::replace(&mut *current, root.clone())
         };
+        {
+            let mut head = lock(&self.head);
+            if Arc::ptr_eq(&head, &old) {
+                *head = root;
+            }
+        }
         // A value's destructor may read this Db, so the old root must outlive
         // the root write guard.
         drop(old);
@@ -322,12 +337,12 @@ impl Db {
         ReadTxn(self.snapshot())
     }
 
-    /// Opens the write transaction. Blocks until the previous one commits or is
-    /// dropped.
+    /// Opens the write transaction on the newest prepared root. Blocks until
+    /// the previous one commits or is dropped.
     #[must_use]
     pub fn write(&self) -> WriteTxn<'_> {
         let guard = lock(&self.write);
-        let root = (*self.snapshot()).clone();
+        let root = lock(&self.head).clone();
         let pending = std::iter::repeat_with(|| None)
             .take(root.tables.len())
             .collect();
@@ -355,6 +370,44 @@ impl Db {
             }
         }
         self.install(Arc::new(root));
+    }
+
+    /// Makes a prepared root visible and returns its revision.
+    ///
+    /// # Panics
+    ///
+    /// If `p` is not prepared on the visible root, which is what publishing out
+    /// of the order the roots were prepared in looks like. Also propagates a
+    /// panic from the commit hook.
+    pub fn publish(&self, p: Prepared) -> Revision {
+        let Prepared {
+            parent,
+            root,
+            closed,
+            dirty,
+        } = p;
+        assert!(
+            Arc::ptr_eq(&self.snapshot(), &parent),
+            "published a root prepared on an older one"
+        );
+        let revision = root.revision;
+        self.install(root.clone());
+        closed.close();
+        if dirty {
+            let txn = ReadTxn(root);
+            lock(&self.hook)(revision, &txn);
+        }
+        revision
+    }
+
+    /// Drops a prepared root and puts `head` back on the one it was built on.
+    /// Nothing ever saw it, so none of its cells are closed.
+    ///
+    /// The writer lock is not reentrant: an open [`WriteTxn`] must be dropped
+    /// first.
+    pub fn abandon(&self, p: Prepared) {
+        let _guard = lock(&self.write);
+        *lock(&self.head) = p.parent;
     }
 }
 
@@ -900,30 +953,46 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
 pub struct WriteTxn<'a> {
     db: &'a Db,
     _guard: MutexGuard<'a, ()>,
-    root: Root,
+    /// The root this transaction opened on; `prepare` clones it to build the
+    /// new one.
+    root: Arc<Root>,
     /// One slot per table, `Some` once the table is touched.
     pending: Vec<Option<Box<dyn AnyPending>>>,
     dirty: bool,
 }
 
+/// A root this transaction settled but no reader has seen. Stays on the thread
+/// that prepared it: `Closed` holds cells that are neither `Send` nor `Sync`.
+pub struct Prepared {
+    /// The root this one was built on, which [`Db::publish`] checks is still
+    /// the visible one.
+    parent: Arc<Root>,
+    root: Arc<Root>,
+    closed: Closed,
+    dirty: bool,
+}
+
 impl WriteTxn<'_> {
-    /// Installs the new root and returns its revision, which is the previous
-    /// one if nothing was written.
-    ///
-    /// # Panics
-    ///
-    /// Propagates a panic from the commit hook.
-    pub fn commit(self) -> Revision {
+    /// Settles the trees, moves `head` onto the new root and releases the
+    /// writer lock. Nothing is visible until [`Db::publish`].
+    #[must_use]
+    pub fn prepare(self) -> Prepared {
         let WriteTxn {
             db,
             _guard: guard,
-            mut root,
+            root: parent,
             pending,
             dirty,
         } = self;
         if pending.iter().all(Option::is_none) {
-            return root.revision;
+            return Prepared {
+                root: parent.clone(),
+                parent,
+                closed: Closed::default(),
+                dirty: false,
+            };
         }
+        let mut root = (*parent).clone();
         let revision = root.revision + Revision::from(dirty);
         let mut closed = Closed::default();
         for (pos, table) in pending.into_iter().enumerate() {
@@ -941,15 +1010,29 @@ impl WriteTxn<'_> {
         }
         root.revision = revision;
 
-        let snapshot = Arc::new(root);
-        db.install(snapshot.clone());
-        closed.close();
-        if dirty {
-            let txn = ReadTxn(snapshot);
-            lock(&db.hook)(revision, &txn);
-        }
+        let root = Arc::new(root);
+        *lock(&db.head) = root.clone();
         drop(guard);
-        revision
+        Prepared {
+            parent,
+            root,
+            closed,
+            dirty,
+        }
+    }
+
+    /// Installs the new root and returns its revision, which is the previous
+    /// one if nothing was written.
+    ///
+    /// # Panics
+    ///
+    /// If a prepared root is still unpublished: this transaction opened on it,
+    /// not on the visible root. Also propagates a panic from the commit hook.
+    // The revision is worth ignoring; the commit itself is the point.
+    #[allow(clippy::must_use_candidate)]
+    pub fn commit(self) -> Revision {
+        let db = self.db;
+        db.publish(self.prepare())
     }
 }
 

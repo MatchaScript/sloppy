@@ -152,4 +152,23 @@ fn bench(n: u64) {
         assert!(seen > 0);
     }
     println!("N={n} changes_drain {}", ns(spent, 10));
+    drop(changes);
+
+    // (f) Case (a) again with the commit split in two. Only the prepare runs
+    // under the writer lock, so it is the critical section throughput follows.
+    let batch: Vec<Route> = (0..10_000).map(|_| route(rng.below(n), 5)).collect();
+    let mut preparing = Duration::ZERO;
+    let mut publishing = Duration::ZERO;
+    for value in batch {
+        let mut txn = db.write();
+        table.insert(&mut txn, value);
+        let clock = Instant::now();
+        let prepared = txn.prepare();
+        preparing += clock.elapsed();
+        let clock = Instant::now();
+        db.publish(prepared);
+        publishing += clock.elapsed();
+    }
+    println!("N={n} prepare {}", ns(preparing, 10_000));
+    println!("N={n} publish {}", ns(publishing, 10_000));
 }
