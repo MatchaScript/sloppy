@@ -1,5 +1,5 @@
 //! Row 2 and row 3 of the plan: root cell, transactions, revision, the change
-//! stream, watches, the watermark, `compact`.
+//! stream, watches, `compact`.
 
 use std::sync::Arc;
 
@@ -93,7 +93,7 @@ fn snapshots_hold_their_version() {
     assert_eq!(
         items
             .prefix(&after, b"b")
-            .map(|(v, _)| v.key)
+            .map(|(_, v, _)| v.key)
             .collect::<Vec<_>>(),
         vec!["b"]
     );
@@ -131,7 +131,7 @@ fn a_write_txn_reads_its_own_writes() {
     assert_eq!(
         items
             .lower_bound(&w, b"a")
-            .map(|(v, r)| (v.key, v.val, r))
+            .map(|(_, v, r)| (v.key, v.val, r))
             .collect::<Vec<_>>(),
         vec![("b", 2, 2), ("c", 2, 2), ("d", 1, 1)]
     );
@@ -180,16 +180,24 @@ fn abort_leaves_nothing() {
     assert_eq!(db.write().commit(), 1);
 }
 
+/// A reader observes the table from where it stood when it was taken, so one
+/// taken in a transaction that never commits reads the commits that follow it.
 #[test]
-#[should_panic(expected = "registration transaction did not commit")]
-fn a_change_reader_rejects_an_aborted_registration() {
+fn a_change_reader_from_an_aborted_registration_reads_on() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
     let mut w = db.write();
     let mut reader = items.changes(&mut w);
     drop(w);
 
-    let _ = reader.next(&db.read());
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    assert_eq!(
+        drain(reader.next(&db.read()).unwrap().0),
+        vec![("a".into(), 1, false)]
+    );
 }
 
 #[test]
@@ -217,7 +225,7 @@ fn table_revision_tracks_its_own_writes() {
     assert_eq!(two.revision(&r), 1);
 }
 
-/// Registers a reader over `items` and commits, so the tracker takes effect.
+/// Takes a reader over `items`, observing the table where it stands.
 fn observe(db: &Db, items: Table<Item>) -> ChangeIterator<Item> {
     let mut w = db.write();
     let it = items.changes(&mut w);
@@ -265,8 +273,6 @@ fn changes_report_one_record_per_key_and_commit() {
     let mut w = db.write();
     items.insert(&mut w, item("c", 1));
     assert_eq!(w.commit(), 5);
-    // The reader has read up to 4, so this commit releases everything below.
-    assert_eq!(items.held_records(&db.read()), [5]);
     let mut w = db.write();
     items.delete(&mut w, b"c");
     assert_eq!(w.commit(), 6);
@@ -292,14 +298,12 @@ fn a_key_written_twice_in_one_commit_leaves_one_record() {
     items.insert(&mut w, item("a", 1));
     items.insert(&mut w, item("a", 2));
     assert_eq!(w.commit(), 1);
-    assert_eq!(items.held_records(&db.read()), [1]);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 3));
     assert_eq!(w.commit(), 2);
 
     let r = db.read();
-    assert_eq!(items.held_records(&r), [1, 2]);
     assert_eq!(versions(items, &r, b"a"), [(1, 2, false), (2, 3, false)]);
     assert_eq!(
         drain(reader.next(&r).unwrap().0),
@@ -330,8 +334,10 @@ fn changes_carry_the_value_each_commit_left() {
     );
 }
 
+/// Two readers of one table read it apart: each is told of the deletion once,
+/// with the value it removed, whenever it gets round to reading.
 #[test]
-fn a_deletion_is_held_until_every_reader_has_read() {
+fn every_reader_is_told_of_a_deletion() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
@@ -346,51 +352,35 @@ fn a_deletion_is_held_until_every_reader_has_read() {
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 2);
     let r = db.read();
-    assert_eq!(items.held_records(&r), [2]);
     // The key is gone, and the tombstone that ends its row holds the value.
     assert!(items.get(&r, b"a").is_none());
     assert_eq!(versions(items, &r, b"a"), [(1, 1, false), (2, 1, true)]);
 
     assert_eq!(drain(fast.next(&r).unwrap().0), vec![("a".into(), 2, true)]);
 
-    // The slow reader has not seen it, so the next commit keeps it.
+    // The slow reader has not read it, and the record is still there for it.
     let mut w = db.write();
     items.insert(&mut w, item("b", 1));
     assert_eq!(w.commit(), 3);
-    assert_eq!(items.held_records(&db.read()), [2, 3]);
 
     let r = db.read();
     assert_eq!(
         drain(slow.next(&r).unwrap().0),
         vec![("a".into(), 2, true), ("b".into(), 3, false)]
     );
+    // Each reader is told once: the fast one gets what came after its read.
     let mut w = db.write();
     items.insert(&mut w, item("c", 1));
     assert_eq!(w.commit(), 4);
-    // Both readers are past the deletion, so only the newer records are left.
-    assert_eq!(items.held_records(&db.read()), [3, 4]);
-}
-
-#[test]
-fn dropping_a_reader_releases_the_deletion() {
-    let db = Db::new();
-    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    assert_eq!(w.commit(), 1);
-
-    let reader = observe(&db, items);
-    let mut w = db.write();
-    items.delete(&mut w, b"a");
-    assert_eq!(w.commit(), 2);
-    assert_eq!(items.held_records(&db.read()), [2]);
-
-    drop(reader);
-    let mut w = db.write();
-    items.insert(&mut w, item("b", 1));
-    assert_eq!(w.commit(), 3);
-    assert!(items.held_records(&db.read()).is_empty());
+    let r = db.read();
+    assert_eq!(
+        drain(fast.next(&r).unwrap().0),
+        vec![("b".into(), 3, false), ("c".into(), 4, false)]
+    );
+    assert_eq!(
+        drain(slow.next(&r).unwrap().0),
+        vec![("c".into(), 4, false)]
+    );
 }
 
 /// Rebuilding a table by deleting every key and writing it again leaves one
@@ -419,7 +409,6 @@ fn re_creating_a_key_in_the_same_commit_replaces_its_deletion() {
         w.commit();
 
         let r = db.read();
-        let rounds = usize::try_from(round).unwrap();
         let round = Revision::from(round);
         assert_eq!(
             items
@@ -428,11 +417,6 @@ fn re_creating_a_key_in_the_same_commit_replaces_its_deletion() {
                 .map(|v| (v.revision, v.deleted)),
             Some((round, false)),
             "round {round} ends on the value, not the deletion"
-        );
-        assert_eq!(
-            items.held_records(&r).len(),
-            2 * (rounds - 1),
-            "round {round} left one record per key"
         );
     }
 
@@ -449,22 +433,37 @@ fn re_creating_a_key_in_the_same_commit_replaces_its_deletion() {
     );
 }
 
+/// Reading a change does not release its record: what one reader has taken is
+/// still there for the next, and only a compaction drops it.
 #[test]
-fn no_reader_means_no_held_record() {
+fn records_live_until_a_compaction() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
-    let mut w = db.write();
-    items.insert(&mut w, item("a", 1));
-    w.commit();
-    let mut w = db.write();
-    items.delete(&mut w, b"a");
-    w.commit();
+    let mut eager = observe(&db, items);
+    let mut lazy = observe(&db, items);
+    let mut stalled = observe(&db, items);
 
-    let r = db.read();
-    assert!(items.held_records(&r).is_empty());
-    assert!(items.get(&r, b"a").is_none());
-    assert_eq!(versions(items, &r, b"a"), [(1, 1, false), (2, 1, true)]);
+    for val in 1..=3 {
+        let mut w = db.write();
+        items.insert(&mut w, item("a", val));
+        assert_eq!(w.commit(), Revision::from(val));
+        assert_eq!(eager.next(&db.read()).unwrap().0.count(), 1);
+    }
+
+    // The reader that waited is told of every commit, one record each.
+    assert_eq!(
+        drain(lazy.next(&db.read()).unwrap().0),
+        vec![
+            ("a".into(), 1, false),
+            ("a".into(), 2, false),
+            ("a".into(), 3, false),
+        ]
+    );
+
+    db.compact(3);
+    assert_eq!(stalled.next(&db.read()).err().map(|e| e.at), Some(3));
+    assert_eq!(eager.next(&db.read()).unwrap().0.count(), 0);
 }
 
 /// The versions a compaction released go when the key is next written; until
@@ -496,11 +495,12 @@ fn a_write_trims_the_versions_a_compaction_released() {
     assert_eq!(w.commit(), 4);
     assert_eq!(
         versions(items, &db.read(), b"a"),
-        [(3, 3, false), (4, 4, false)]
+        [(2, 2, false), (3, 3, false), (4, 4, false)],
+        "the version at the bound ends the row, so a reader there still reads it"
     );
 
     // The same over a longer row: what the write leaves is every version past
-    // the bound, the one it just wrote included.
+    // the bound, the one at the bound and the one it just wrote included.
     for val in 5..=7 {
         let mut w = db.write();
         items.insert(&mut w, item("a", val));
@@ -512,7 +512,7 @@ fn a_write_trims_the_versions_a_compaction_released() {
     assert_eq!(w.commit(), 8);
     assert_eq!(
         versions(items, &db.read(), b"a"),
-        [(6, 6, false), (7, 7, false), (8, 8, false)]
+        [(5, 5, false), (6, 6, false), (7, 7, false), (8, 8, false)]
     );
 }
 
@@ -546,13 +546,13 @@ fn a_compaction_past_a_deletion_sweeps_the_row() {
     );
 }
 
-/// The bound is the lower of the two: a change reader that has not seen the
-/// deletion keeps the row, however far the compaction bound has gone.
+/// The compaction bound is the only bound: a change reader that has not seen
+/// the deletion loses it with the row, and says so when it next reads.
 #[test]
-fn a_reader_below_a_deletion_keeps_the_row() {
+fn a_reader_below_a_deletion_loses_it() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
-    let _reader = observe(&db, items);
+    let mut reader = observe(&db, items);
 
     let mut w = db.write();
     items.insert(&mut w, item("a", 1));
@@ -562,10 +562,8 @@ fn a_reader_below_a_deletion_keeps_the_row() {
     assert_eq!(w.commit(), 2);
 
     db.compact(2);
-    assert_eq!(
-        versions(items, &db.read(), b"a"),
-        [(1, 1, false), (2, 1, true)]
-    );
+    assert!(versions(items, &db.read(), b"a").is_empty());
+    assert_eq!(reader.next(&db.read()).err().map(|e| e.at), Some(2));
 }
 
 /// The caller's revision is what the transaction writes at and what its commit
@@ -621,11 +619,9 @@ fn compact_drops_history_the_reader_needed() {
     let mut w = db.write();
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 2);
-    assert_eq!(items.held_records(&db.read()), [2]);
 
     db.compact(2);
     let r = db.read();
-    assert!(items.held_records(&r).is_empty());
     // Compaction is not history.
     assert_eq!(r.revision(), 2);
 
@@ -676,7 +672,7 @@ fn reads_on_drop_key(_: &ReadsOnDrop) -> Key {
 }
 
 #[test]
-fn compact_drops_values_outside_the_root_lock() {
+fn compact_drops_values_outside_the_writer_lock() {
     let db = Arc::new(Db::new());
     let items = db.table("items", reads_on_drop_key as fn(&ReadsOnDrop) -> Key, &[]);
 
@@ -706,7 +702,7 @@ fn compact_drops_values_outside_the_root_lock() {
 }
 
 #[test]
-fn stale_snapshot_does_not_rewind_the_tracker() {
+fn stale_snapshot_does_not_rewind_the_reader() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
     let mut reader = observe(&db, items);
@@ -937,6 +933,34 @@ fn an_index_follows_the_values_it_covers() {
     assert_eq!(listed, [("r2", 1)]);
 }
 
+/// An index entry carries versions like the row it lists, so a listing is read
+/// at the reader's revision: what a later commit deleted or moved is still
+/// listed for a reader taken before it.
+#[test]
+fn an_index_lists_what_its_reader_can_see() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write();
+    rows.insert(&mut w, row("r1", &["a"]));
+    rows.insert(&mut w, row("r2", &["a"]));
+    assert_eq!(w.commit(), 1);
+    let before = db.read();
+
+    let mut w = db.write();
+    rows.delete(&mut w, b"r1");
+    rows.insert(&mut w, row("r2", &["b"]));
+    assert_eq!(w.commit(), 2);
+
+    let listed: Vec<_> = rows
+        .by_index(&before, "tenant", b"a")
+        .map(|(v, _)| v.key)
+        .collect();
+    assert_eq!(listed, ["r1", "r2"], "the reader is before both writes");
+    assert!(by_tenant(&db, rows, "a").is_empty());
+    assert_eq!(by_tenant(&db, rows, "b"), ["r2"]);
+}
+
 /// An index key is arbitrary bytes. The entry keeps it apart from the primary
 /// key that follows it, so a key holding the byte the two used to be joined
 /// with is still only found by itself.
@@ -1003,7 +1027,6 @@ fn load_puts_a_row_back_without_a_record() {
     assert_eq!(by_tenant(&db, rows, "b"), ["r1"]);
     assert!(by_tenant(&db, rows, "a").is_empty());
 
-    assert!(rows.held_records(&r).is_empty());
     assert_eq!(reader.next(&r).map(|(c, _)| c.count()).ok(), Some(0));
 }
 
@@ -1112,10 +1135,10 @@ fn commits_from_two_threads_serialize() {
     assert_eq!(items.get(&r, b"b").unwrap().0.val, ROUNDS - 1);
 }
 
-/// `table` and `compact` replace the visible root between transactions, and the
-/// next `write` has to open on what they left, not on the root before them.
+/// `table` and `compact` run between transactions without moving the revision,
+/// and the next `write` carries on from where they left the database.
 #[test]
-fn table_and_compact_carry_the_head_along() {
+fn table_and_compact_leave_the_revision_where_it_was() {
     let db = Db::new();
     let items = db.table("items", pk as fn(&Item) -> Key, &[]);
 
@@ -1133,15 +1156,12 @@ fn table_and_compact_carry_the_head_along() {
     let mut w = db.write();
     items.delete(&mut w, b"a");
     assert_eq!(w.commit(), 3);
-    assert_eq!(items.held_records(&db.read()), [3]);
 
     db.compact(3);
-    assert!(items.held_records(&db.read()).is_empty());
+    assert_eq!(db.read().revision(), 3, "a compaction is not a commit");
     let mut w = db.write();
     items.insert(&mut w, item("b", 1));
     assert_eq!(w.commit(), 4);
-    // The deletion's record would be back if this commit had built on the root
-    // from before the compaction.
-    assert_eq!(items.held_records(&db.read()), [4]);
+    // The reader lost the deletion the compaction dropped.
     assert_eq!(slow.next(&db.read()).err().map(|e| e.at), Some(3));
 }

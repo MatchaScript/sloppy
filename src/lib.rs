@@ -3,8 +3,5 @@
 //! database.
 
 pub mod db;
-/// The snapshot tree `db` still reads and writes, until its rows carry their
-/// own versions and it moves onto [`tree`].
-mod snapshot_tree;
 pub mod tree;
 pub mod watch;

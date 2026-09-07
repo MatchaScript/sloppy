@@ -141,28 +141,6 @@ fn a_node_grows_and_shrinks_through_every_split_and_merge() {
 }
 
 #[test]
-fn remove_below_clears_the_left_edge() {
-    let tree: Tree<u64> = Tree::new();
-    for i in 0..300u32 {
-        tree.insert(&i.to_be_bytes(), u64::from(i));
-    }
-
-    tree.remove_below(&200u32.to_be_bytes());
-
-    tree.assert_invariants();
-    assert_eq!(tree.get(&199u32.to_be_bytes()), None);
-    assert_eq!(tree.get(&200u32.to_be_bytes()), Some(200));
-    assert_eq!(entries(&tree).len(), 100);
-
-    // Below everything and above everything: the whole tree, and nothing.
-    tree.remove_below(&[]);
-    assert_eq!(entries(&tree).len(), 100);
-    tree.remove_below(&[0xff]);
-    assert_eq!(entries(&tree).len(), 0);
-    tree.assert_invariants();
-}
-
-#[test]
 fn a_walk_keeps_keys_that_extend_the_last_one_with_zero_bytes() {
     // The walk seeks the next leaf at `last ++ 0x00`, so a key that is exactly
     // that, or extends it, must still come out. Enough keys to cross leaves.

@@ -677,16 +677,6 @@ impl<V: Clone> Tree<V> {
             taken: Vec::new().into_iter(),
         }
     }
-
-    /// Removes every entry with a key below `key`, from the left edge.
-    pub fn remove_below(&self, key: &[u8]) {
-        for (found, _) in self.range_from(&[]) {
-            if *found >= *key {
-                break;
-            }
-            self.remove(&found);
-        }
-    }
 }
 
 /// Writes `value` at `key` below `node`, which is write-locked, and returns

@@ -153,5 +153,4 @@ fn bench(n: u64) {
         assert!(seen > 0);
     }
     println!("N={n} changes_drain {}", ns(spent, 10));
-    drop(changes);
 }

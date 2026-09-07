@@ -145,7 +145,7 @@ fn main() {
     for _ in 0..rounds {
         let r = db.read();
         let mut i = 0u64;
-        for (o, _) in t.all(&r) {
+        for (_, o, _) in t.all(&r) {
             assert_eq!(o.id, i);
             i += 1;
         }
