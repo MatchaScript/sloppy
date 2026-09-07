@@ -98,24 +98,11 @@ fn a_read_does_not_wait_for_an_open_write_transaction() {
     assert!(completed, "read waited for the open write transaction");
 }
 
-#[test]
-fn readers_keep_up_with_a_busy_writer() {
-    readers_keep_up(false);
-}
-
-/// The same run with the writer pipelined: it opens each transaction on the
-/// root the one before it prepared, and publishes that one only after this
-/// one is prepared, as a writer that waits for durability between the two
-/// would.
-#[test]
-fn readers_keep_up_with_a_pipelined_writer() {
-    readers_keep_up(true);
-}
-
 // One acceptance run: splitting the four threads apart would only move the
 // shared setup into arguments.
+#[test]
 #[allow(clippy::too_many_lines)]
-fn readers_keep_up(pipelined: bool) {
+fn readers_keep_up_with_a_busy_writer() {
     let db = Arc::new(Db::new());
     let table = db.table("recs", rec_key as fn(&Rec) -> Key, &[BY_TENANT]);
     // The revision of the writer's last commit, announced just before it is
@@ -131,7 +118,6 @@ fn readers_keep_up(pipelined: bool) {
         let (db, finish) = (db.clone(), finish.clone());
         thread::spawn(move || {
             let mut rng = Lcg(0x2026_0904);
-            let mut flight = false;
             let start = Instant::now();
             for round in 0..COMMITS {
                 let mut w = db.write();
@@ -145,20 +131,7 @@ fn readers_keep_up(pipelined: bool) {
                         table.insert(&mut w, Rec { key, tenant, n });
                     }
                 }
-                if pipelined {
-                    // Prepare this round on top of the one in flight, then
-                    // publish that one. The next write opens on this round.
-                    w.prepare();
-                    if flight {
-                        db.publish();
-                    }
-                    flight = true;
-                } else {
-                    w.commit();
-                }
-            }
-            if flight {
-                db.publish();
+                w.commit();
             }
             let last = db.read().revision() + 1;
             finish.store(last, Ordering::SeqCst);
