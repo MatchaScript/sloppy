@@ -148,19 +148,13 @@ impl<V> TableEntry<V> {
 
 /// The type-erased face of `TableEntry<V>`: what the `Root` can do without
 /// knowing the value type.
-trait AnyTable: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
+trait AnyTable: Any + Send + Sync {
     /// Drops dead trackers and every graveyard object at or below the
     /// watermark. `None` means nothing changed.
     fn collect(&self, compacted: Revision) -> Option<Arc<dyn AnyTable>>;
 }
 
 impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn collect(&self, compacted: Revision) -> Option<Arc<dyn AnyTable>> {
         let mut trackers = Vec::with_capacity(self.trackers.len());
         let mut watermark = Revision::MAX;
@@ -403,7 +397,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         root.tables
             .get(self.pos)
             .filter(|_| root.db == self.db)
-            .and_then(|t| t.as_any().downcast_ref())
+            .and_then(|t| (&**t as &dyn Any).downcast_ref())
             .unwrap_or_else(|| panic!("table {} belongs to another Db or value type", self.name))
     }
 
@@ -607,10 +601,9 @@ impl<V: Send + Sync + 'static> Table<V> {
             };
             txn.pending[self.pos] = Some(Box::new(pending));
         }
-        txn.pending[self.pos]
-            .as_mut()
-            .expect("just opened")
-            .as_any_mut()
+        (txn.pending[self.pos]
+            .as_deref_mut()
+            .expect("just opened") as &mut dyn Any)
             .downcast_mut()
             .expect("pending table opened with another value type")
     }
@@ -728,12 +721,10 @@ struct Pending<V> {
     primary_key: fn(&V) -> Key,
 }
 
-trait AnyPending {
+trait AnyPending: Any {
     /// Builds the new table entry. `closed` collects the cells of the primary
     /// tree, which the caller closes once the new root is in place.
     fn install(self: Box<Self>, revision: Revision, closed: &mut Closed) -> Arc<dyn AnyTable>;
-
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
@@ -776,9 +767,6 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
         })
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
 /// The write transaction. Dropping it aborts: nothing was ever visible.
