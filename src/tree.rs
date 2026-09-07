@@ -158,8 +158,8 @@ impl<V: Send + Sync> Closes for Node<V> {
 
 type Slot<V> = Option<Arc<Node<V>>>;
 
-/// The children of one node, in the four sizes of `StateDB`'s `part`
-/// (`part/node.go`). Every kind holds its occupied slots in ascending key
+/// The children of one node, in the four adaptive-radix-tree sizes (4, 16, 48,
+/// 256). Every kind holds its occupied slots in ascending key
 /// order, so an in-order walk is a slice walk whatever the kind is.
 ///
 /// The two large kinds are boxed, so a node with few children stays small.
@@ -359,7 +359,7 @@ impl<V> Children<V> {
     /// Builds the kind that fits `len` children, taken in ascending key order.
     ///
     /// The kind follows from the count alone, so growth and shrink are one rule
-    /// read in two directions, at the boundaries `part/txn.go` uses: a node4
+    /// read in two directions, at the usual boundaries: a node4
     /// full at 4 promotes on the 5th child, and a node16 back down to 4 demotes.
     fn build(len: usize, children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
         match len {

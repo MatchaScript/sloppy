@@ -38,8 +38,8 @@ impl<V> Clone for Object<V> {
 
 /// Key of the revision indexes: the revision, big-endian, then the primary key.
 ///
-/// `StateDB` gives every object its own revision, so the revision alone is a
-/// unique index key (`write_txn.go:130`). Here one revision covers a whole
+/// Were every object given its own revision, the revision alone would be a
+/// unique index key. Here one revision covers a whole
 /// commit, so the primary key is appended to keep the entries of one commit
 /// apart. The ordering is unchanged: revision first, ascending.
 fn rev_key(revision: Revision, key: &[u8]) -> Key {
