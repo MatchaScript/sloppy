@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use sloppy::db::{Db, Key, Table};
 
+#[derive(Clone)]
 struct Obj {
     id: u64,
 }
@@ -62,6 +63,7 @@ fn shuffled(n: u64) -> Vec<u64> {
 const N: u64 = 1_000;
 const N_ITER: u64 = 100_000;
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     // WriteTxn_1: one replace per commit on a one-object table.
     let db = Db::new();
@@ -155,4 +157,43 @@ fn main() {
         "FullIteration_All {} ns/op",
         ns(clock.elapsed(), rounds * N_ITER)
     );
+
+    // Tree_*: the bare tree, without the table layer above it.
+    {
+        let before = rss_kb();
+        let tree = sloppy::tree::Tree::<Obj>::new();
+        let mut txn = tree.txn();
+        for id in 0..N_ITER {
+            txn.insert(&id.to_be_bytes(), Obj { id });
+        }
+        let _tree = txn.commit_and_notify();
+        println!(
+            "Tree_resident {} B/object",
+            (rss_kb() - before) * 1024 / N_ITER
+        );
+
+        let commits = 2_000;
+        let batch = 1_000u64;
+        let clock = Instant::now();
+        let mut tree = sloppy::tree::Tree::<Obj>::new();
+        for _ in 0..commits {
+            let mut txn = tree.txn();
+            for id in 0..batch {
+                txn.insert(&id.to_be_bytes(), Obj { id });
+            }
+            tree = txn.commit_and_notify();
+        }
+        println!(
+            "Tree_WriteTxn_1000 {} ns/op",
+            ns(clock.elapsed(), commits * batch)
+        );
+
+        let clock = Instant::now();
+        let rounds = 100_000;
+        for i in 0..rounds {
+            let id = i % batch;
+            assert_eq!(tree.value(&id.to_be_bytes()).map(|o| o.id), Some(id));
+        }
+        println!("Tree_RandomLookup {} ns/op", ns(clock.elapsed(), rounds));
+    }
 }

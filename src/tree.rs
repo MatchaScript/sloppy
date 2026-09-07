@@ -53,7 +53,7 @@ impl Deref for Prefix {
     }
 }
 
-// ponytail: four node kinds, and nothing below them - no SIMD key compare, no
+// ponytail: seven node kinds, and nothing below them - no SIMD key compare, no
 // separate leaf node. The kind follows from the child count, so a path copy
 // picks it and growth and shrink need no code of their own.
 struct Node<V> {
@@ -65,6 +65,11 @@ struct Node<V> {
     subtree: Cell,
     /// Closed only by a commit that writes or removes this node's own value, so
     /// it outlives the node and is shared by every copy that keeps the value.
+    ///
+    /// `None` on a node with no value, and on every node of a tree whose values
+    /// are zero-sized: such a tree is watched by subtree only, which is to say
+    /// [`Tree::get`] on it falls back to the subtree cell. The index trees rely
+    /// on that.
     value_cell: Option<Arc<Cell>>,
     /// The transaction that created this node. While that transaction runs, the
     /// node is reachable only from its root, so it can be mutated in place.
@@ -74,7 +79,7 @@ struct Node<V> {
 impl<V> Node<V> {
     /// The value is new here, so its cell starts fresh if a value is present.
     fn new(prefix: &[u8], value: Option<V>, children: Children<V>, txn: TxnId) -> Arc<Self> {
-        let value_cell = value.is_some().then(Arc::default);
+        let value_cell = (value.is_some() && size_of::<V>() > 0).then(Arc::default);
         Arc::new(Self {
             prefix: Prefix::new(prefix),
             value,
@@ -159,13 +164,18 @@ impl<V: Send + Sync> Closes for Node<V> {
 
 type Slot<V> = Option<Arc<Node<V>>>;
 
-/// The children of one node, in the four adaptive-radix-tree sizes (4, 16, 48,
-/// 256). Every kind holds its occupied slots in ascending key
-/// order, so an in-order walk is a slice walk whatever the kind is.
+/// The children of one node, in the adaptive-radix-tree sizes (4, 16, 48, 256)
+/// with 0, 1 and 2 split off below them. Every kind holds its occupied slots in
+/// ascending key order, so an in-order walk is a slice walk whatever the kind
+/// is.
 ///
-/// The two large kinds are boxed, so a node with few children stays small.
+/// Every kind from two children up is boxed, so a node with none or one - which
+/// is most of them - stays small.
 enum Children<V> {
-    N4(Sorted<V, 4>),
+    N0,
+    N1(Sorted<V, 1>),
+    N2(Box<Sorted<V, 2>>),
+    N4(Box<Sorted<V, 4>>),
     N16(Box<Sorted<V, 16>>),
     N48(Box<Node48<V>>),
     N256(Box<Node256<V>>),
@@ -174,8 +184,8 @@ enum Children<V> {
 /// Up to `K` children, with the keys beside the slots so a lookup does not
 /// chase the `Arc`s.
 struct Sorted<V, const K: usize> {
-    keys: [u8; K],
     slots: [Slot<V>; K],
+    keys: [u8; K],
     len: u8,
 }
 
@@ -229,8 +239,8 @@ impl<V> Clone for Node256<V> {
 impl<V, const K: usize> Sorted<V, K> {
     fn fill(children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
         let mut this = Self {
-            keys: [0; K],
             slots: [const { None }; K],
+            keys: [0; K],
             len: 0,
         };
         for child in children {
@@ -341,6 +351,9 @@ impl<V> Node256<V> {
 impl<V> Clone for Children<V> {
     fn clone(&self) -> Self {
         match self {
+            Self::N0 => Self::N0,
+            Self::N1(s) => Self::N1(s.clone()),
+            Self::N2(s) => Self::N2(s.clone()),
             Self::N4(s) => Self::N4(s.clone()),
             Self::N16(s) => Self::N16(s.clone()),
             Self::N48(n) => Self::N48(n.clone()),
@@ -357,7 +370,10 @@ impl<V> Children<V> {
     /// full at 4 promotes on the 5th child, and a node16 back down to 4 demotes.
     fn build(len: usize, children: impl Iterator<Item = Arc<Node<V>>>) -> Self {
         match len {
-            0..=4 => Self::N4(Sorted::fill(children)),
+            0 => Self::N0,
+            1 => Self::N1(Sorted::fill(children)),
+            2 => Self::N2(Box::new(Sorted::fill(children))),
+            3..=4 => Self::N4(Box::new(Sorted::fill(children))),
             5..=16 => Self::N16(Box::new(Sorted::fill(children))),
             17..=48 => {
                 let mut this = Node48 {
@@ -388,7 +404,7 @@ impl<V> Children<V> {
     }
 
     fn empty() -> Self {
-        Self::build(0, iter::empty())
+        Self::N0
     }
 
     fn one(child: Arc<Node<V>>) -> Self {
@@ -403,6 +419,9 @@ impl<V> Children<V> {
 
     fn len(&self) -> usize {
         match self {
+            Self::N0 => 0,
+            Self::N1(s) => usize::from(s.len),
+            Self::N2(s) => usize::from(s.len),
             Self::N4(s) => usize::from(s.len),
             Self::N16(s) => usize::from(s.len),
             Self::N48(n) => usize::from(n.len),
@@ -413,6 +432,9 @@ impl<V> Children<V> {
     /// How many children this kind holds before the next one takes over.
     fn cap(&self) -> usize {
         match self {
+            Self::N0 => 0,
+            Self::N1(_) => 1,
+            Self::N2(_) => 2,
             Self::N4(_) => 4,
             Self::N16(_) => 16,
             Self::N48(_) => 48,
@@ -423,6 +445,9 @@ impl<V> Children<V> {
     /// The slots in ascending key order. Only `N256` has empty ones.
     fn slots(&self) -> &[Slot<V>] {
         match self {
+            Self::N0 => &[],
+            Self::N1(s) => s.occupied(),
+            Self::N2(s) => s.occupied(),
             Self::N4(s) => s.occupied(),
             Self::N16(s) => s.occupied(),
             Self::N48(n) => &n.slots[..usize::from(n.len)],
@@ -433,6 +458,9 @@ impl<V> Children<V> {
     /// The same slots, for a caller that takes children out of them.
     fn slots_mut(&mut self) -> &mut [Slot<V>] {
         match self {
+            Self::N0 => &mut [],
+            Self::N1(s) => &mut s.slots[..usize::from(s.len)],
+            Self::N2(s) => &mut s.slots[..usize::from(s.len)],
             Self::N4(s) => &mut s.slots[..usize::from(s.len)],
             Self::N16(s) => &mut s.slots[..usize::from(s.len)],
             Self::N48(n) => &mut n.slots[..usize::from(n.len)],
@@ -446,6 +474,9 @@ impl<V> Children<V> {
 
     fn get(&self, byte: u8) -> Option<&Arc<Node<V>>> {
         match self {
+            Self::N0 => None,
+            Self::N1(s) => s.get(byte),
+            Self::N2(s) => s.get(byte),
             Self::N4(s) => s.get(byte),
             Self::N16(s) => s.get(byte),
             Self::N48(n) => match n.index[usize::from(byte)] {
@@ -459,6 +490,9 @@ impl<V> Children<V> {
     /// The slot filed under `byte`. Only `N256` has one for an absent child.
     fn slot_mut(&mut self, byte: u8) -> Option<&mut Slot<V>> {
         match self {
+            Self::N0 => None,
+            Self::N1(s) => s.slot_mut(byte),
+            Self::N2(s) => s.slot_mut(byte),
             Self::N4(s) => s.slot_mut(byte),
             Self::N16(s) => s.slot_mut(byte),
             Self::N48(n) => match n.index[usize::from(byte)] {
@@ -510,6 +544,9 @@ impl<V> Children<V> {
             return;
         }
         match self {
+            Self::N0 => unreachable!("cap is 0, handled above"),
+            Self::N1(s) => s.with(byte, child),
+            Self::N2(s) => s.with(byte, child),
             Self::N4(s) => s.with(byte, child),
             Self::N16(s) => s.with(byte, child),
             Self::N48(n) => n.with(byte, child),
@@ -523,7 +560,10 @@ impl<V> Children<V> {
     fn without(&mut self, byte: u8) {
         let len = self.len();
         let demotes = match self {
-            Self::N4(_) => false,
+            Self::N0 => false,
+            Self::N1(_) => len == 1,
+            Self::N2(_) => len == 2,
+            Self::N4(_) => len == 3,
             Self::N16(_) => len == 5,
             Self::N48(_) => len == 17,
             Self::N256(_) => len == 49,
@@ -541,6 +581,9 @@ impl<V> Children<V> {
             return;
         }
         match self {
+            Self::N0 => unreachable!(),
+            Self::N1(s) => s.without(byte),
+            Self::N2(s) => s.without(byte),
             Self::N4(s) => s.without(byte),
             Self::N16(s) => s.without(byte),
             Self::N48(n) => n.without(byte),
@@ -581,9 +624,18 @@ impl<V> Children<V> {
     fn assert_ok(&self) {
         let len = self.len();
         let fits = match self {
+            Self::N0 => len == 0,
+            Self::N1(s) => {
+                s.assert_keys();
+                len == 1
+            }
+            Self::N2(s) => {
+                s.assert_keys();
+                len == 2
+            }
             Self::N4(s) => {
                 s.assert_keys();
-                len <= 4
+                (3..=4).contains(&len)
             }
             Self::N16(s) => {
                 s.assert_keys();
@@ -1062,7 +1114,7 @@ fn insert<V: Clone + Send + Sync + 'static>(
                 w.closed.push(cell.clone());
             }
             let n = Node::own(node, w);
-            n.value_cell = Some(Arc::default());
+            n.value_cell = (size_of::<V>() > 0).then(Arc::default);
             return n.value.replace(value);
         }
 
@@ -1161,8 +1213,9 @@ mod layout {
     #[test]
     fn node_layout() {
         println!(
-            "Node<u64> {}, Prefix {}, Children<u64> {}, Cell {}",
+            "Node<u64> {}, Node<()> {}, Prefix {}, Children<u64> {}, Cell {}",
             size_of::<Node<u64>>(),
+            size_of::<Node<()>>(),
             size_of::<Prefix>(),
             size_of::<Children<u64>>(),
             size_of::<Cell>(),
