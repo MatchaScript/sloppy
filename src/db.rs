@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use tokio::sync::watch;
 
-use crate::tree::{self, Tree};
+use crate::snapshot_tree::{self as tree, Tree};
 use crate::watch::{Covered, Watch};
 
 pub type Revision = u64;

@@ -1,15 +1,25 @@
-//! Persistent B+tree keyed by byte strings.
+//! Mutable B+tree keyed by byte strings.
 //!
-//! A write path-copies: every node from the root down to the change is rebuilt,
-//! everything else stays shared through `Arc`. A node this transaction already
-//! rebuilt is mutated in place instead, which is what the `txn` stamp is for.
+//! Every node sits behind its own `RwLock` inside an `Arc`. A reader walks from
+//! the root to a leaf with lock coupling: it takes the child's read lock before
+//! it lets go of the parent's, so it can never be routed by a branch that the
+//! writer is in the middle of restructuring. The single writer takes the leaf's
+//! write lock and writes the entry in place; a write that would overfill or
+//! empty out a leaf goes down again holding the write lock of every node on the
+//! path, and that second descent is where splits, borrows and merges happen.
 //!
 //! Values live in the leaves; a branch holds separators and children. The keys
 //! of one node sit end to end in a single buffer with their offsets beside it,
-//! so rebuilding the node copies two allocations rather than one per key. A
-//! leaf keeps the common prefix of its keys once and the remainders in that
-//! buffer, so a descent matches the prefix and then binary-searches remainders
-//! that no longer repeat it.
+//! so moving keys between nodes copies runs of bytes rather than one allocation
+//! per key. A leaf keeps the common prefix of its keys once and the remainders
+//! in that buffer, so a descent matches the prefix and then binary-searches
+//! remainders that no longer repeat it.
+//!
+//! A walk holds no lock between leaves: it takes one leaf's worth of entries as
+//! owned values and seeks again from the root for the next leaf. Nodes carry no
+//! sibling pointers, so a split has nothing to keep straight but the parent's
+//! separators, and a key that moved to the new sibling is found by the seek
+//! that follows.
 //!
 //! The depth is `log` of the entry count, so every walk down and back up is a
 //! recursion the keys' owner cannot make deep.
@@ -19,10 +29,7 @@
 //! to decide.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
-
-/// Identifies the transaction that built a node. `0` is "no transaction".
-type TxnId = u64;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Entries in a leaf, children in a branch. A node over this splits.
 const ORDER: usize = 32;
@@ -35,11 +42,19 @@ fn lcp(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// A node's lock, taken as it stands. A writer that panicked under it left one
+/// node's arrays as they were mid-write, not the tree's shape, so the poison
+/// flag says nothing the tree acts on.
+fn read<V>(node: &RwLock<Node<V>>) -> RwLockReadGuard<'_, Node<V>> {
+    node.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<V>(node: &RwLock<Node<V>>) -> RwLockWriteGuard<'_, Node<V>> {
+    node.write().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The keys of one node, in ascending order, end to end in one buffer.
-///
-/// A path copy clones this with two allocations whatever the key count is,
-/// which is what the layout is for.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Keys {
     bytes: Vec<u8>,
     /// Where each key ends in `bytes`; the previous end is where it starts.
@@ -159,14 +174,12 @@ struct Leaf<V> {
     /// Each key with `prefix` cut off the front.
     rest: Keys,
     values: Vec<V>,
-    txn: TxnId,
 }
 
 /// `separators[i]` is the first key of `children[i + 1]`.
 struct Branch<V> {
     separators: Keys,
-    children: Vec<Arc<Node<V>>>,
-    txn: TxnId,
+    children: Vec<Link<V>>,
 }
 
 enum Node<V> {
@@ -174,16 +187,29 @@ enum Node<V> {
     Branch(Branch<V>),
 }
 
+/// A node as its parent holds it: one lock of its own, shared with whoever is
+/// reading it.
+type Link<V> = Arc<RwLock<Node<V>>>;
+
 /// A node that came out of a split: its first key, and the node.
-type Split<V> = Option<(Box<[u8]>, Arc<Node<V>>)>;
+type Split<V> = Option<(Box<[u8]>, Link<V>)>;
+
+/// One entry as a walk hands it out: the whole key, and a copy of the value.
+type Entry<V> = (Box<[u8]>, V);
+
+/// One leaf's worth of entries, and the key the next leaf starts at or above.
+type Batch<V> = (Vec<Entry<V>>, Option<Box<[u8]>>);
+
+fn link<V>(node: Node<V>) -> Link<V> {
+    Arc::new(RwLock::new(node))
+}
 
 impl<V> Leaf<V> {
-    fn empty(txn: TxnId) -> Self {
+    fn empty() -> Self {
         Self {
             prefix: Box::default(),
             rest: Keys::default(),
             values: Vec::new(),
-            txn,
         }
     }
 
@@ -209,6 +235,17 @@ impl<V> Leaf<V> {
         key.extend_from_slice(&self.prefix);
         key.extend_from_slice(rest);
         key.into()
+    }
+
+    /// Puts `value` at `at`, where `key` was found not to be.
+    fn place(&mut self, at: usize, key: &[u8], value: V) {
+        self.rest.insert(at, &key[self.prefix.len()..]);
+        self.values.insert(at, value);
+    }
+
+    fn take(&mut self, at: usize) -> V {
+        self.rest.remove(at);
+        self.values.remove(at)
     }
 
     /// Cuts the shared prefix back to `keep` bytes, giving what it loses back
@@ -249,7 +286,7 @@ impl<V> Leaf<V> {
         self.rest.rewrite(&[], common);
     }
 
-    fn split(&mut self, txn: TxnId) -> Split<V> {
+    fn split(&mut self) -> Split<V> {
         if self.rest.len() <= ORDER {
             return None;
         }
@@ -258,31 +295,27 @@ impl<V> Leaf<V> {
             prefix: self.prefix.clone(),
             rest: self.rest.split_off(at),
             values: self.values.split_off(at),
-            txn,
         };
         let first = right.full_key(0);
         self.compress();
         right.compress();
-        Some((first, Arc::new(Node::Leaf(right))))
+        Some((first, link(Node::Leaf(right))))
     }
-}
 
-impl<V: Clone> Leaf<V> {
-    /// Appends every entry of `other`, which sorts after this one.
-    fn absorb(&mut self, other: &Self) {
+    /// Takes every entry of `other`, which sorts after this one.
+    fn absorb(&mut self, other: &mut Self) {
         self.shrink(lcp(&self.prefix, &other.prefix));
         let carried = &other.prefix[self.prefix.len()..];
         for at in 0..other.rest.len() {
             self.rest.push(carried, other.rest.get(at));
         }
-        self.values.extend(other.values.iter().cloned());
+        self.values.append(&mut other.values);
     }
 
     /// Moves one entry from the front of `other` onto the end of this leaf.
     fn take_first(&mut self, other: &mut Self) {
         let key = other.full_key(0);
-        other.rest.remove(0);
-        let value = other.values.remove(0);
+        let value = other.take(0);
         self.adopt(&key);
         self.rest.push(&key[self.prefix.len()..], &[]);
         self.values.push(value);
@@ -292,8 +325,7 @@ impl<V: Clone> Leaf<V> {
     fn take_last(&mut self, other: &mut Self) {
         let last = other.rest.len() - 1;
         let key = other.full_key(last);
-        other.rest.remove(last);
-        let value = other.values.pop().expect("the leaf held it");
+        let value = other.take(last);
         self.adopt(&key);
         self.rest.insert(0, &key[self.prefix.len()..]);
         self.values.insert(0, value);
@@ -306,7 +338,12 @@ impl<V> Branch<V> {
         self.separators.upper_bound(key)
     }
 
-    fn split(&mut self, txn: TxnId) -> Split<V> {
+    /// Entries for a leaf child, children for a branch one.
+    fn child_len(&self, at: usize) -> usize {
+        read(&self.children[at]).len()
+    }
+
+    fn split(&mut self) -> Split<V> {
         if self.children.len() <= ORDER {
             return None;
         }
@@ -319,10 +356,9 @@ impl<V> Branch<V> {
         separators.remove(0);
         Some((
             first,
-            Arc::new(Node::Branch(Self {
+            link(Node::Branch(Self {
                 separators,
                 children,
-                txn,
             })),
         ))
     }
@@ -332,58 +368,16 @@ impl<V> Branch<V> {
         self.separators.remove(at);
         self.separators.insert(at, key);
     }
-}
 
-impl<V> Node<V> {
-    fn txn(&self) -> TxnId {
-        match self {
-            Self::Leaf(leaf) => leaf.txn,
-            Self::Branch(branch) => branch.txn,
-        }
-    }
-
-    /// Entries for a leaf, children for a branch.
-    fn len(&self) -> usize {
-        match self {
-            Self::Leaf(leaf) => leaf.values.len(),
-            Self::Branch(branch) => branch.children.len(),
-        }
-    }
-}
-
-impl<V: Clone> Node<V> {
-    fn copy(&self, txn: TxnId) -> Self {
-        match self {
-            Self::Leaf(leaf) => Self::Leaf(Leaf {
-                prefix: leaf.prefix.clone(),
-                rest: leaf.rest.clone(),
-                values: leaf.values.clone(),
-                txn,
-            }),
-            Self::Branch(branch) => Self::Branch(Branch {
-                separators: branch.separators.clone(),
-                children: branch.children.clone(),
-                txn,
-            }),
-        }
-    }
-
-    /// The node this transaction may mutate: `*node` itself when this
-    /// transaction built it, a path copy of it otherwise. A node this
-    /// transaction built has never been published, so nobody can be reading it.
-    fn own(node: &mut Arc<Self>, txn: TxnId) -> &mut Self {
-        if node.txn() != txn {
-            *node = Arc::new(node.copy(txn));
-        }
-        Arc::get_mut(node).expect("a node stamped with this transaction is not shared")
-    }
-}
-
-impl<V: Clone> Branch<V> {
     /// Restores the entry count of child `at` after a delete took it below
     /// `MIN`, by merging it with a neighbour or moving one entry across.
-    fn rebalance(&mut self, at: usize, txn: TxnId) {
-        if self.children[at].len() >= MIN || self.children.len() < 2 {
+    ///
+    /// Both children are write-locked while their entries move, and this
+    /// branch's own lock is held throughout, so a reader is either already
+    /// inside one of them and holding it up, or has yet to be told which of
+    /// them its key is in.
+    fn rebalance(&mut self, at: usize) {
+        if self.child_len(at) >= MIN || self.children.len() < 2 {
             return;
         }
         let (left, right) = if at + 1 < self.children.len() {
@@ -391,24 +385,26 @@ impl<V: Clone> Branch<V> {
         } else {
             (at - 1, at)
         };
-        if self.children[left].len() + self.children[right].len() <= ORDER {
-            self.merge(left, txn);
+        if self.child_len(left) + self.child_len(right) <= ORDER {
+            self.merge(left);
         } else {
-            self.shift(left, at == left, txn);
+            self.shift(left, at == left);
         }
     }
 
     /// Folds `left + 1` into `left`.
-    fn merge(&mut self, left: usize, txn: TxnId) {
+    fn merge(&mut self, left: usize) {
         let separator = self.separators.owned(left);
         self.separators.remove(left);
         let right = self.children.remove(left + 1);
-        match (Node::own(&mut self.children[left], txn), &*right) {
+        let mut into = write(&self.children[left]);
+        let mut from = write(&right);
+        match (&mut *into, &mut *from) {
             (Node::Leaf(a), Node::Leaf(b)) => a.absorb(b),
             (Node::Branch(a), Node::Branch(b)) => {
                 a.separators.push(&separator, &[]);
                 a.separators.append(&b.separators);
-                a.children.extend(b.children.iter().cloned());
+                a.children.append(&mut b.children);
             }
             _ => unreachable!("every leaf is at the same depth"),
         }
@@ -416,74 +412,134 @@ impl<V: Clone> Branch<V> {
 
     /// Moves one entry between `left` and `left + 1`, towards `left` when
     /// `to_left`, and files the right neighbour under its new first key.
-    fn shift(&mut self, left: usize, to_left: bool, txn: TxnId) {
+    fn shift(&mut self, left: usize, to_left: bool) {
         let separator = self.separators.owned(left);
-        let (below, above) = self.children.split_at_mut(left + 1);
-        let raised = match (
-            Node::own(&mut below[left], txn),
-            Node::own(&mut above[0], txn),
-        ) {
-            (Node::Leaf(a), Node::Leaf(b)) => {
-                if to_left {
-                    a.take_first(b);
-                } else {
-                    b.take_last(a);
+        let raised = {
+            let mut below = write(&self.children[left]);
+            let mut above = write(&self.children[left + 1]);
+            match (&mut *below, &mut *above) {
+                (Node::Leaf(a), Node::Leaf(b)) => {
+                    if to_left {
+                        a.take_first(b);
+                    } else {
+                        b.take_last(a);
+                    }
+                    b.full_key(0)
                 }
-                b.full_key(0)
-            }
-            (Node::Branch(a), Node::Branch(b)) => {
-                if to_left {
-                    a.separators.push(&separator, &[]);
-                    a.children.push(b.children.remove(0));
-                    let raised = b.separators.owned(0);
-                    b.separators.remove(0);
-                    raised
-                } else {
-                    b.children.insert(0, a.children.pop().expect("held it"));
-                    b.separators.insert(0, &separator);
-                    let last = a.separators.len() - 1;
-                    let raised = a.separators.owned(last);
-                    a.separators.remove(last);
-                    raised
+                (Node::Branch(a), Node::Branch(b)) => {
+                    if to_left {
+                        a.separators.push(&separator, &[]);
+                        a.children.push(b.children.remove(0));
+                        let raised = b.separators.owned(0);
+                        b.separators.remove(0);
+                        raised
+                    } else {
+                        b.children.insert(0, a.children.pop().expect("held it"));
+                        b.separators.insert(0, &separator);
+                        let last = a.separators.len() - 1;
+                        let raised = a.separators.owned(last);
+                        a.separators.remove(last);
+                        raised
+                    }
                 }
+                _ => unreachable!("every leaf is at the same depth"),
             }
-            _ => unreachable!("every leaf is at the same depth"),
         };
         self.refile(left, &raised);
     }
 }
 
-// ------------------------------------------------------------------- lookup
-
-/// The value at `key`.
-fn find<'a, V>(root: &'a Arc<Node<V>>, key: &[u8]) -> Option<&'a V> {
-    let mut node: &Node<V> = root;
-    loop {
-        match node {
-            Node::Leaf(leaf) => return leaf.locate(key).ok().map(|at| &leaf.values[at]),
-            Node::Branch(branch) => node = &branch.children[branch.child_of(key)],
+impl<V> Node<V> {
+    /// Entries for a leaf, children for a branch.
+    fn len(&self) -> usize {
+        match self {
+            Self::Leaf(leaf) => leaf.values.len(),
+            Self::Branch(branch) => branch.children.len(),
         }
     }
+
+    fn leaf(&mut self) -> &mut Leaf<V> {
+        match self {
+            Self::Leaf(leaf) => leaf,
+            Self::Branch(_) => unreachable!("the descent stopped at a leaf"),
+        }
+    }
+}
+
+// ------------------------------------------------------------------- descent
+
+/// Walks to the leaf `key` belongs to and hands it to `f`, along with the
+/// separator that fences the leaf on the right if it has one.
+///
+/// Each child's read lock is taken before the parent's is let go, so the writer
+/// cannot move `key` out of a leaf between the branch that named the leaf and
+/// the leaf itself: to restructure either, it must take a lock this walk is
+/// holding.
+fn descend<V, R, F: FnOnce(&Leaf<V>, Option<&[u8]>) -> R>(
+    guard: RwLockReadGuard<'_, Node<V>>,
+    key: &[u8],
+    hi: Option<&[u8]>,
+    f: F,
+) -> R {
+    let (child, fence) = match &*guard {
+        Node::Leaf(leaf) => return f(leaf, hi),
+        Node::Branch(branch) => {
+            let at = branch.child_of(key);
+            let fence = (at < branch.separators.len()).then(|| branch.separators.owned(at));
+            (branch.children[at].clone(), fence)
+        }
+    };
+    let below = read(&child);
+    drop(guard);
+    descend(below, key, fence.as_deref().or(hi), f)
+}
+
+/// The leaf `key` belongs to. Only the writer walks this way: it is the one
+/// thread that changes the shape, so it can let go of a branch before it reads
+/// the child the branch named.
+fn leaf_of<V>(root: &Link<V>, key: &[u8]) -> Link<V> {
+    let mut node = root.clone();
+    loop {
+        let below = match &*read(&node) {
+            Node::Leaf(_) => None,
+            Node::Branch(branch) => Some(branch.children[branch.child_of(key)].clone()),
+        };
+        match below {
+            Some(child) => node = child,
+            None => return node,
+        }
+    }
+}
+
+/// The entries of the leaf `from` belongs to, from `from` onwards, and the key
+/// the next leaf starts at or above.
+fn batch<V: Clone>(root: &Link<V>, from: &[u8]) -> Batch<V> {
+    descend(read(root), from, None, |leaf, hi| {
+        let at = leaf.locate(from).unwrap_or_else(|at| at);
+        let taken = (at..leaf.rest.len())
+            .map(|at| (leaf.full_key(at), leaf.values[at].clone()))
+            .collect();
+        (taken, hi.map(Box::from))
+    })
+}
+
+/// The first key that sorts after `key`: every byte string above `key` is at or
+/// above it.
+fn after(key: &[u8]) -> Box<[u8]> {
+    let mut next = Vec::with_capacity(key.len() + 1);
+    next.extend_from_slice(key);
+    next.push(0);
+    next.into()
 }
 
 // --------------------------------------------------------------------- tree
 
-/// An immutable snapshot. `clone` is one `Arc` bump.
+/// A B+tree one thread writes and any number read.
 pub struct Tree<V> {
-    root: Arc<Node<V>>,
-    len: usize,
-    /// The transaction that produced this tree; the next one gets `last_txn + 1`.
-    last_txn: TxnId,
-}
-
-impl<V> Clone for Tree<V> {
-    fn clone(&self) -> Self {
-        Self {
-            root: self.root.clone(),
-            len: self.len,
-            last_txn: self.last_txn,
-        }
-    }
+    /// The root keeps its identity for the life of the tree: a split moves its
+    /// contents into a new child and a collapse pulls the last child's back up,
+    /// so a walk that is already inside the root stays on the tree.
+    root: Link<V>,
 }
 
 impl<V> Default for Tree<V> {
@@ -496,54 +552,97 @@ impl<V> Tree<V> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root: Arc::new(Node::Leaf(Leaf::empty(0))),
-            len: 0,
-            last_txn: 0,
+            root: link(Node::Leaf(Leaf::empty())),
         }
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The value at `key`.
-    #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
-        find(&self.root, key)
-    }
-
-    /// Every entry whose key starts with `p`.
-    #[must_use]
-    pub fn prefix(&self, p: &[u8]) -> Iter<'_, V> {
-        Iter::under(&self.root, p)
-    }
-
-    /// Every entry with a key `>= key`, in order.
-    #[must_use]
-    pub fn lower_bound(&self, key: &[u8]) -> Iter<'_, V> {
-        Iter::from(&self.root, key)
-    }
-
-    /// Every entry, in ascending key order.
-    #[allow(clippy::iter_without_into_iter)] // `IntoIterator` for `&Tree` has no user yet.
-    #[must_use]
-    pub fn iter(&self) -> Iter<'_, V> {
-        Iter::whole(&self.root)
-    }
-
-    #[must_use]
-    pub fn txn(&self) -> Txn<V> {
-        Txn {
-            root: self.root.clone(),
-            len: self.len,
-            id: self.last_txn + 1,
+    /// Writes `value` at `key` and returns what it replaced.
+    pub fn insert(&self, key: &[u8], value: V) -> Option<V> {
+        let leaf = leaf_of(&self.root, key);
+        {
+            let mut guard = write(&leaf);
+            let held = guard.leaf();
+            held.adopt(key);
+            match held.locate(key) {
+                Ok(at) => return Some(std::mem::replace(&mut held.values[at], value)),
+                Err(at) if held.rest.len() < ORDER => {
+                    held.place(at, key, value);
+                    return None;
+                }
+                Err(_) => {}
+            }
         }
+        // The leaf is full, so the write has to be able to split it and file
+        // the half that comes off in the parent.
+        self.insert_deep(key, value);
+        None
+    }
+
+    /// Removes `key` and returns what was there.
+    // The removed value is worth ignoring; the removal itself is the point.
+    #[allow(clippy::must_use_candidate)]
+    pub fn remove(&self, key: &[u8]) -> Option<V> {
+        let leaf = leaf_of(&self.root, key);
+        {
+            let mut guard = write(&leaf);
+            let held = guard.leaf();
+            let at = held.locate(key).ok()?;
+            if held.rest.len() > MIN || Arc::ptr_eq(&leaf, &self.root) {
+                return Some(held.take(at));
+            }
+        }
+        // The leaf is down to `MIN`, so the delete has to be able to rebalance
+        // it against a sibling.
+        Some(self.remove_deep(key))
+    }
+
+    /// Hands the value at `key` to `f`, under the leaf's write lock. Does
+    /// nothing if the key is not there.
+    pub fn update(&self, key: &[u8], f: impl FnOnce(&mut V)) {
+        let leaf = leaf_of(&self.root, key);
+        let mut guard = write(&leaf);
+        let held = guard.leaf();
+        if let Ok(at) = held.locate(key) {
+            f(&mut held.values[at]);
+        }
+    }
+
+    /// Writes a key the leaf it belongs to had no room for, holding the write
+    /// lock of every node from the root down so no reader is routed by a branch
+    /// a split has yet to reach.
+    fn insert_deep(&self, key: &[u8], value: V) {
+        let mut root = write(&self.root);
+        if let Some((separator, right)) = insert_at(&mut root, key, value) {
+            let left = std::mem::replace(
+                &mut *root,
+                Node::Branch(Branch {
+                    separators: Keys::default(),
+                    children: Vec::new(),
+                }),
+            );
+            let Node::Branch(branch) = &mut *root else {
+                unreachable!("just put a branch there")
+            };
+            branch.separators.push(&separator, &[]);
+            branch.children.push(link(left));
+            branch.children.push(right);
+        }
+    }
+
+    /// Removes a key whose leaf would underflow, under the same locks.
+    fn remove_deep(&self, key: &[u8]) -> V {
+        let mut root = write(&self.root);
+        let old = remove_at(&mut root, key);
+        // A branch left with a single child is a level that fences nothing. The
+        // child's contents come up into the root, and the child is left holding
+        // the emptied branch, which points at nothing.
+        if let Node::Branch(branch) = &mut *root
+            && branch.children.len() == 1
+        {
+            let only = branch.children.pop().expect("just counted it");
+            std::mem::swap(&mut *root, &mut *write(&only));
+        }
+        old
     }
 
     /// Checks the shape invariants. Test helper.
@@ -555,10 +654,85 @@ impl<V> Tree<V> {
     /// leaves are at different depths, or a node is over- or under-filled.
     #[doc(hidden)]
     pub fn assert_invariants(&self) {
-        let mut values = 0;
         let mut depth = None;
-        check(&self.root, 0, true, None, None, &mut values, &mut depth);
-        assert_eq!(values, self.len, "tree len disagrees with its values");
+        check(&read(&self.root), 0, true, None, None, &mut depth);
+    }
+}
+
+impl<V: Clone> Tree<V> {
+    /// The value at `key`.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<V> {
+        descend(read(&self.root), key, None, |leaf, _| {
+            leaf.locate(key).ok().map(|at| leaf.values[at].clone())
+        })
+    }
+
+    /// Every entry with a key `>= key`, in ascending key order.
+    #[must_use]
+    pub fn range_from(&self, key: &[u8]) -> Iter<V> {
+        Iter {
+            root: self.root.clone(),
+            from: Some(key.into()),
+            taken: Vec::new().into_iter(),
+        }
+    }
+
+    /// Removes every entry with a key below `key`, from the left edge.
+    pub fn remove_below(&self, key: &[u8]) {
+        for (found, _) in self.range_from(&[]) {
+            if *found >= *key {
+                break;
+            }
+            self.remove(&found);
+        }
+    }
+}
+
+/// Writes `value` at `key` below `node`, which is write-locked, and returns
+/// what `node` split off, if anything.
+fn insert_at<V>(node: &mut Node<V>, key: &[u8], value: V) -> Split<V> {
+    match node {
+        Node::Leaf(leaf) => {
+            leaf.adopt(key);
+            match leaf.locate(key) {
+                Ok(at) => {
+                    leaf.values[at] = value;
+                    None
+                }
+                Err(at) => {
+                    leaf.place(at, key, value);
+                    leaf.split()
+                }
+            }
+        }
+        Node::Branch(branch) => {
+            let at = branch.child_of(key);
+            let split = insert_at(&mut write(&branch.children[at]), key, value);
+            if let Some((separator, right)) = split {
+                branch.separators.insert(at, &separator);
+                branch.children.insert(at + 1, right);
+            }
+            branch.split()
+        }
+    }
+}
+
+/// Removes `key`, which must be present, below the write-locked `node`.
+fn remove_at<V>(node: &mut Node<V>, key: &[u8]) -> V {
+    match node {
+        Node::Leaf(leaf) => {
+            let at = leaf
+                .locate(key)
+                .expect("the key was found before the descent");
+            leaf.take(at)
+        }
+        Node::Branch(branch) => {
+            let at = branch.child_of(key);
+            let old = remove_at(&mut write(&branch.children[at]), key);
+            branch.rebalance(at);
+            old
+        }
     }
 }
 
@@ -570,7 +744,6 @@ fn check<V>(
     is_root: bool,
     lo: Option<&[u8]>,
     hi: Option<&[u8]>,
-    values: &mut usize,
     leaf_depth: &mut Option<usize>,
 ) {
     assert!(
@@ -599,7 +772,6 @@ fn check<V>(
                 assert!(lo.is_none_or(|lo| **key >= *lo), "key below its separator");
                 assert!(hi.is_none_or(|hi| **key < *hi), "key above its separator");
             }
-            *values += keys.len();
         }
         Node::Branch(branch) => {
             assert_eq!(
@@ -618,7 +790,7 @@ fn check<V>(
                 } else {
                     hi
                 };
-                check(child, depth + 1, false, below, above, values, leaf_depth);
+                check(&read(child), depth + 1, false, below, above, leaf_depth);
             }
         }
     }
@@ -626,260 +798,32 @@ fn check<V>(
 
 // --------------------------------------------------------------------- walk
 
-/// Yields values in ascending byte-lexicographic key order.
-pub struct Iter<'a, V> {
-    /// The branches on the path down, each with the child to descend into next.
-    stack: Vec<(&'a Branch<V>, usize)>,
-    /// The leaf the walk is in, and the entry to yield next.
-    leaf: Option<(&'a Leaf<V>, usize)>,
-    /// The key of the entry the last `next` returned.
-    path: Vec<u8>,
-    /// Stops the walk at the first key that does not start with this.
-    stop: Option<Box<[u8]>>,
+/// Yields entries in ascending byte-lexicographic key order.
+///
+/// One leaf's worth of entries is taken at a time and handed out as owned
+/// values, so the walk holds no lock between them and the writer is free to
+/// reshape the tree behind it. The next leaf is found by seeking again from the
+/// root, past the last key that was yielded.
+pub struct Iter<V> {
+    root: Link<V>,
+    /// Where the next seek starts. `None` once the walk has run off the end.
+    from: Option<Box<[u8]>>,
+    taken: std::vec::IntoIter<Entry<V>>,
 }
 
-impl<'a, V> Iter<'a, V> {
-    fn empty() -> Self {
-        Self {
-            stack: Vec::new(),
-            leaf: None,
-            path: Vec::new(),
-            stop: None,
-        }
-    }
+impl<V: Clone> Iterator for Iter<V> {
+    type Item = Entry<V>;
 
-    /// The whole tree, in order.
-    fn whole(root: &'a Arc<Node<V>>) -> Self {
-        let mut iter = Self::empty();
-        iter.descend(root);
-        iter
-    }
-
-    /// Every entry with a key `>= key`, in order.
-    fn from(root: &'a Arc<Node<V>>, key: &[u8]) -> Self {
-        let mut iter = Self::empty();
-        let mut node: &'a Node<V> = root;
-        loop {
-            match node {
-                Node::Leaf(leaf) => {
-                    iter.leaf = Some((leaf, leaf.locate(key).unwrap_or_else(|at| at)));
-                    return iter;
-                }
-                Node::Branch(branch) => {
-                    let at = branch.child_of(key);
-                    iter.stack.push((branch, at + 1));
-                    node = &branch.children[at];
-                }
-            }
-        }
-    }
-
-    /// Every entry whose key starts with `p`.
-    fn under(root: &'a Arc<Node<V>>, p: &[u8]) -> Self {
-        let mut iter = Self::from(root, p);
-        iter.stop = Some(p.into());
-        iter
-    }
-
-    /// Enters the leftmost leaf of `node`.
-    fn descend(&mut self, node: &'a Node<V>) {
-        let mut node = node;
-        loop {
-            match node {
-                Node::Leaf(leaf) => {
-                    self.leaf = Some((leaf, 0));
-                    return;
-                }
-                Node::Branch(branch) => {
-                    self.stack.push((branch, 1));
-                    node = &branch.children[0];
-                }
-            }
-        }
-    }
-
-    /// Moves on to the next leaf. `false` when there is none.
-    fn advance(&mut self) -> bool {
-        while let Some(&(branch, at)) = self.stack.last() {
-            if at < branch.children.len() {
-                self.stack.last_mut().expect("just read").1 = at + 1;
-                self.descend(&branch.children[at]);
-                return true;
-            }
-            self.stack.pop();
-        }
-        false
-    }
-
-    /// The key of the entry the last [`Iterator::next`] returned. Meaningless
-    /// before the first `next`, and after one that returned `None`.
-    #[must_use]
-    pub fn key(&self) -> &[u8] {
-        &self.path
-    }
-}
-
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = &'a V;
-
-    // ponytail: no allocation per entry; the key is rebuilt in the walk's own
-    // buffer, which `key` hands out a borrow of.
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (leaf, at) = self.leaf?;
-            if at == leaf.values.len() {
-                self.leaf = None;
-                if self.advance() {
-                    continue;
-                }
-                return None;
+            if let Some(entry) = self.taken.next() {
+                return Some(entry);
             }
-            self.leaf = Some((leaf, at + 1));
-            self.path.clear();
-            self.path.extend_from_slice(&leaf.prefix);
-            self.path.extend_from_slice(leaf.rest.get(at));
-            if self
-                .stop
-                .as_ref()
-                .is_some_and(|p| !self.path.starts_with(p))
-            {
-                self.leaf = None;
-                self.stack.clear();
-                return None;
-            }
-            return Some(&leaf.values[at]);
-        }
-    }
-}
-
-// -------------------------------------------------------------------- write
-
-/// A batch of writes over one snapshot. Dropping it aborts.
-pub struct Txn<V> {
-    root: Arc<Node<V>>,
-    len: usize,
-    /// This transaction's stamp: the node it built, it may write in place.
-    id: TxnId,
-}
-
-impl<V: Clone> Txn<V> {
-    #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
-        find(&self.root, key)
-    }
-
-    /// Every entry, in ascending key order.
-    #[allow(clippy::iter_without_into_iter)] // `IntoIterator` for `&Txn` has no user yet.
-    #[must_use]
-    pub fn iter(&self) -> Iter<'_, V> {
-        Iter::whole(&self.root)
-    }
-
-    /// Every entry whose key starts with `p`.
-    #[must_use]
-    pub fn prefix(&self, p: &[u8]) -> Iter<'_, V> {
-        Iter::under(&self.root, p)
-    }
-
-    /// Every entry with a key `>= key`, in order.
-    #[must_use]
-    pub fn lower_bound(&self, key: &[u8]) -> Iter<'_, V> {
-        Iter::from(&self.root, key)
-    }
-
-    /// Returns the replaced value.
-    pub fn insert(&mut self, key: &[u8], value: V) -> Option<V> {
-        let (old, split) = insert(&mut self.root, key, value, self.id);
-        if let Some((separator, right)) = split {
-            let left = std::mem::replace(&mut self.root, Arc::new(Node::Leaf(Leaf::empty(0))));
-            let mut separators = Keys::default();
-            separators.push(&separator, &[]);
-            self.root = Arc::new(Node::Branch(Branch {
-                separators,
-                children: vec![left, right],
-                txn: self.id,
-            }));
-        }
-        if old.is_none() {
-            self.len += 1;
-        }
-        old
-    }
-
-    pub fn delete(&mut self, key: &[u8]) -> Option<V> {
-        // The descent below rebuilds as it goes, so the key is looked up first:
-        // a miss must leave the tree alone.
-        find(&self.root, key)?;
-        let old = remove(&mut self.root, key, self.id);
-        // A branch left with a single child is a level that fences nothing.
-        while let Node::Branch(branch) = &*self.root {
-            if branch.children.len() != 1 {
-                break;
-            }
-            let only = branch.children[0].clone();
-            self.root = only;
-        }
-        self.len -= 1;
-        Some(old)
-    }
-
-    /// The tree this transaction leaves behind.
-    #[must_use]
-    pub fn commit(self) -> Tree<V> {
-        Tree {
-            root: self.root,
-            len: self.len,
-            last_txn: self.id,
-        }
-    }
-}
-
-/// Writes `value` at `key` below `*node`, replacing `*node` with the node that
-/// takes its place and returning what that node split off, if anything.
-fn insert<V: Clone>(
-    node: &mut Arc<Node<V>>,
-    key: &[u8],
-    value: V,
-    txn: TxnId,
-) -> (Option<V>, Split<V>) {
-    match Node::own(node, txn) {
-        Node::Leaf(leaf) => {
-            leaf.adopt(key);
-            match leaf.locate(key) {
-                Ok(at) => (Some(std::mem::replace(&mut leaf.values[at], value)), None),
-                Err(at) => {
-                    leaf.rest.insert(at, &key[leaf.prefix.len()..]);
-                    leaf.values.insert(at, value);
-                    (None, leaf.split(txn))
-                }
-            }
-        }
-        Node::Branch(branch) => {
-            let at = branch.child_of(key);
-            let (old, split) = insert(&mut branch.children[at], key, value, txn);
-            if let Some((separator, right)) = split {
-                branch.separators.insert(at, &separator);
-                branch.children.insert(at + 1, right);
-            }
-            (old, branch.split(txn))
-        }
-    }
-}
-
-/// Removes `key`, which must be present, replacing `*node` with the node that
-/// takes its place.
-fn remove<V: Clone>(node: &mut Arc<Node<V>>, key: &[u8], txn: TxnId) -> V {
-    match Node::own(node, txn) {
-        Node::Leaf(leaf) => {
-            let at = leaf.locate(key).expect("the key was looked up first");
-            leaf.rest.remove(at);
-            leaf.values.remove(at)
-        }
-        Node::Branch(branch) => {
-            let at = branch.child_of(key);
-            let old = remove(&mut branch.children[at], key, txn);
-            branch.rebalance(at, txn);
-            old
+            // A seek that lands past the end of its leaf takes nothing, and
+            // the leaf's right fence says where to look instead.
+            let (taken, fence) = batch(&self.root, &self.from.take()?);
+            self.from = taken.last().map_or(fence, |(key, _)| Some(after(key)));
+            self.taken = taken.into_iter();
         }
     }
 }
