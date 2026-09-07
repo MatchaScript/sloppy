@@ -1,9 +1,15 @@
-//! The database: tables, snapshot reads, single-writer transactions.
+//! The database: tables, versioned rows, single-writer transactions.
 //!
-//! One revision counter covers the whole `Db`. A commit that changes anything
-//! bumps it by one, builds a new root and swaps it in behind an `RwLock`
-//! held only for the assignment, so readers never see a half-applied commit and
-//! never block the writer.
+//! One revision counter covers the whole `Db`, and a commit that changes
+//! anything writes it last. A row is a chain of versions, newest first, so a
+//! reader takes the revision the counter holds and follows each chain to the
+//! first version at or below it: what a later commit adds carries a higher
+//! revision and is passed over until the counter says otherwise. A link is
+//! never written again, so a reader that has hold of one keeps what it says.
+//!
+//! A write transaction buffers its writes per table in the order they were
+//! made and applies them under the writer lock, so dropping it touches no tree
+//! and no half-applied commit is ever visible.
 
 mod row;
 mod stream;
@@ -16,12 +22,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use tokio::sync::watch;
 
-use crate::tree::{self, Tree};
+use crate::tree::Tree;
 use crate::watch::{Covered, Watch};
 
-use row::Row;
-use stream::collect;
-use table::{AnyTable, TableEntry};
+use stream::{revision_of, stream_key, table_of};
+use table::{AnyTable, Op, State, TableEntry};
 
 pub use row::Version;
 pub use stream::{Change, ChangeIterator, Compacted};
@@ -31,57 +36,36 @@ pub use write::WriteTxn;
 pub type Revision = u64;
 pub type Key = Box<[u8]>;
 
-/// Everything a snapshot is: swapped as one `Arc`.
-#[derive(Clone)]
-struct Root {
-    /// Identifies the `Db`; a [`Table`] handle carries the same id.
-    db: u64,
-    revision: Revision,
-    /// History below this revision is gone; see [`Db::compact`].
-    compacted: Revision,
-    tables: Vec<Arc<dyn AnyTable>>,
-    /// Every table's change records, one run per table; see [`stream_key`]. A
-    /// record is the primary key that was written: the value is in the row.
-    changes: Tree<Key>,
-}
-
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    // A panic between the two root swaps leaves the root untouched, and one
-    // after them leaves it fully applied, so a poisoned lock guards no torn
-    // state.
+    // A panic under the writer lock leaves the trees as the write it was in the
+    // middle of left them, and the revision unpublished, so a poisoned lock
+    // guards nothing a later writer cannot write over.
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What a [`Watch`] and a [`ReadTxn`] keep hold of: the visible root, and the
-/// receiving end of the revision channel every commit sends on.
+/// What a [`Watch`], a [`ReadTxn`] and the writer all reach the data through.
 ///
-/// The sending end is the [`Db`]'s, so dropping the database closes the
-/// channel and releases every watch parked on it, which is what a watch
-/// outliving its database has to wait for.
+/// The sending end of the revision channel is the [`Db`]'s, so dropping the
+/// database closes the channel and releases every watch parked on it, which is
+/// what a watch outliving its database has to wait for.
 struct Shared {
-    root: RwLock<Arc<Root>>,
+    /// Identifies the `Db`; a [`Table`] handle carries the same id.
+    db: u64,
+    /// The revision every read runs at: written last by a commit, so a reader
+    /// that has it sees everything that commit wrote.
+    revision: AtomicU64,
+    /// History at or below this revision is gone; see [`Db::compact`].
+    compacted: AtomicU64,
+    /// Registered tables, in registration order. Only [`Db::table`] writes it,
+    /// and only by appending, so a handle keeps its position for good.
+    tables: RwLock<Vec<Arc<dyn AnyTable>>>,
+    /// Every table's change records, one run per table; see [`stream_key`]. A
+    /// record is the primary key that was written: the value is in the row.
+    changes: Tree<Key>,
     revisions: watch::Receiver<Revision>,
 }
 
 impl Shared {
-    fn snapshot(&self) -> Arc<Root> {
-        self.root
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// The one place the visible root is replaced.
-    fn install(&self, root: Arc<Root>) {
-        let old = {
-            let mut current = self.root.write().unwrap_or_else(PoisonError::into_inner);
-            std::mem::replace(&mut *current, root)
-        };
-        // A value's destructor may read this Db, so the old root must outlive
-        // the root write guard.
-        drop(old);
-    }
-
     /// A watch on `covers`, as of `at`.
     fn cover(self: &Arc<Self>, at: Revision, covers: Covers) -> Watch {
         // The revision this receiver last saw is the one it was cloned at, and
@@ -98,6 +82,12 @@ impl Shared {
             revisions,
         )
     }
+
+    /// The revision of the last commit that changed one table.
+    fn table_revision(&self, pos: usize) -> Revision {
+        let tables = self.tables.read().unwrap_or_else(PoisonError::into_inner);
+        tables[pos].state().revision.load(Ordering::Acquire)
+    }
 }
 
 /// What one watch covers.
@@ -109,9 +99,9 @@ enum Covers {
     Table(usize),
 }
 
-/// A watch's side of the database: it reads the visible root every time it is
-/// asked, so it needs no registration and a watch taken on a snapshot the
-/// database has already moved past reports the change straight away.
+/// A watch's side of the database: it reads the revision it covers every time
+/// it is asked, so it needs no registration and a watch taken as of a revision
+/// the database has already passed reports the change straight away.
 ///
 /// Both covers compare a revision, which only rises, so a watch reports every
 /// commit to what it covers and never has to read the data.
@@ -125,19 +115,25 @@ struct Cover {
 
 impl Covered for Cover {
     fn changed(&self) -> bool {
-        let root = self.shared.snapshot();
         match self.covers {
-            Covers::Db => root.revision > self.at,
-            Covers::Table(table) => root.tables[table].revision() > self.at,
+            Covers::Db => self.shared.revision.load(Ordering::Acquire) > self.at,
+            // A table's revision lands before the database's; the watch waits
+            // for the latter so the reader it wakes finds the commit visible.
+            Covers::Table(table) => {
+                self.shared
+                    .table_revision(table)
+                    .min(self.shared.revision.load(Ordering::Acquire))
+                    > self.at
+            }
         }
     }
 }
 
 /// The database. Registration and writes are serialized by one writer lock;
-/// reads take an `Arc` of the current root and release the lock at once.
+/// a read takes the revision and holds no lock at all.
 ///
-/// The locks are taken in the order `write`, `root`; every path takes a
-/// subsequence of that, so none of them cycle.
+/// The locks are taken in the order `write`, `tables`, then one tree node at a
+/// time; every path takes a subsequence of that, so none of them cycle.
 pub struct Db {
     shared: Arc<Shared>,
     /// The one sender on the revision channel; see [`Shared::revisions`].
@@ -155,17 +151,14 @@ impl Db {
     #[must_use]
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        let root = Arc::new(Root {
-            db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            revision: 0,
-            compacted: 0,
-            tables: Vec::new(),
-            changes: Tree::new(),
-        });
         let (revisions, receiver) = watch::channel(0);
         Self {
             shared: Arc::new(Shared {
-                root: RwLock::new(root),
+                db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                revision: AtomicU64::new(0),
+                compacted: AtomicU64::new(0),
+                tables: RwLock::new(Vec::new()),
+                changes: Tree::new(),
                 revisions: receiver,
             }),
             revisions,
@@ -173,16 +166,15 @@ impl Db {
         }
     }
 
-    fn snapshot(&self) -> Arc<Root> {
-        self.shared.snapshot()
+    fn revision(&self) -> Revision {
+        self.shared.revision.load(Ordering::Acquire)
     }
 
     /// Completes on the next commit that bumps the revision. A reader that
     /// persists the change stream waits on this and scans what it finds.
     #[must_use]
     pub fn watch(&self) -> Watch {
-        let root = self.snapshot();
-        self.shared.cover(root.revision, Covers::Db)
+        self.shared.cover(self.revision(), Covers::Db)
     }
 
     /// Registers a table. Takes the writer lock and does not bump the revision.
@@ -204,27 +196,32 @@ impl Db {
                 index.name
             );
         }
-        let mut root = (*self.snapshot()).clone();
-        let pos = root.tables.len();
-        root.tables
-            .push(Arc::new(TableEntry::new(primary_key, indexes.to_vec())));
-        let db = root.db;
-        self.shared.install(Arc::new(root));
+        let mut tables = self
+            .shared
+            .tables
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let pos = tables.len();
+        tables.push(Arc::new(TableEntry::new(primary_key, indexes.to_vec())));
         Table {
-            db,
+            db: self.shared.db,
             pos,
             name,
             _v: PhantomData,
         }
     }
 
+    /// A reader at the revision the last commit left.
     #[must_use]
     pub fn read(&self) -> ReadTxn {
-        ReadTxn(self.snapshot(), self.shared.clone())
+        ReadTxn {
+            revision: self.revision(),
+            shared: self.shared.clone(),
+        }
     }
 
-    /// Opens the write transaction on the visible root, at the revision after
-    /// it. Blocks until the previous one commits or is dropped.
+    /// Opens the write transaction at the revision after the visible one.
+    /// Blocks until the previous one commits or is dropped.
     #[must_use]
     pub fn write(&self) -> WriteTxn<'_> {
         self.open(None)
@@ -235,7 +232,7 @@ impl Db {
     ///
     /// # Panics
     ///
-    /// If `rev` is not past the revision of the visible root.
+    /// If `rev` is not past the visible revision.
     #[must_use]
     pub fn write_at(&self, rev: Revision) -> WriteTxn<'_> {
         self.open(Some(rev))
@@ -243,145 +240,159 @@ impl Db {
 
     fn open(&self, at: Option<Revision>) -> WriteTxn<'_> {
         let guard = lock(&self.write);
-        let root = self.snapshot();
-        let revision = at.unwrap_or(root.revision + 1);
+        let visible = self.revision();
+        let revision = at.unwrap_or(visible + 1);
         assert!(
-            revision > root.revision,
-            "revision {revision} is not past the visible {}",
-            root.revision
+            revision > visible,
+            "revision {revision} is not past the visible {visible}"
         );
-        let pending = std::iter::repeat_with(|| None)
-            .take(root.tables.len())
-            .collect();
+        let tables = self
+            .shared
+            .tables
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
         WriteTxn {
             db: self,
             _guard: guard,
-            root,
+            visible,
             revision,
-            pending,
-            changes: None,
-            seq: 0,
+            buffers: std::iter::repeat_with(|| None).take(tables).collect(),
             dirty: false,
         }
     }
 
-    /// Drops the change records at or below `rev` whether or not the change
-    /// iterators have read them; those iterators then fail with [`Compacted`].
+    /// Releases the history at or below `rev`: the versions the next write of
+    /// each row drops, and the change records the readers of the change stream
+    /// then fail on with [`Compacted`].
     ///
     /// This is not history: it does not bump the revision.
     pub fn compact(&self, rev: Revision) {
         let _guard = lock(&self.write);
-        let mut root = (*self.snapshot()).clone();
-        root.compacted = rev.min(root.revision).max(root.compacted);
-        let compacted = root.compacted;
-        collect(&mut root.tables, &mut root.changes, compacted);
-        self.shared.install(Arc::new(root));
+        let compacted = rev.max(self.shared.compacted.load(Ordering::Acquire));
+        self.shared.compacted.store(compacted, Ordering::Release);
+        let tables = self
+            .shared
+            .tables
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (pos, table) in tables.iter().enumerate() {
+            let state = table.state();
+            self.drop_records(pos, compacted, state);
+            if state.buried.load(Ordering::Acquire) <= compacted {
+                table.sweep(compacted);
+            }
+        }
+    }
+
+    /// Drops one table's change records at or below `compacted` and notes the
+    /// highest of them, which is what a reader that had not read them lost.
+    ///
+    /// The bound is published before the records go, so a reader walking the
+    /// stream while this runs reads it back raised once it has passed over
+    /// anything this removed, and is told rather than handed a hole.
+    fn drop_records(&self, pos: usize, compacted: Revision, state: &State) {
+        let mut lost = 0;
+        let mut doomed = Vec::new();
+        for (key, _) in self.shared.changes.range_from(&stream_key(pos, 0, 0)) {
+            if table_of(&key) != pos || revision_of(&key) > compacted {
+                break;
+            }
+            lost = revision_of(&key);
+            doomed.push(key);
+        }
+        if lost > 0 {
+            state.lost.fetch_max(lost, Ordering::AcqRel);
+        }
+        for key in &doomed {
+            self.shared.changes.remove(key);
+        }
     }
 }
 
-/// A snapshot. Holding one keeps its version of the data alive and blocks
-/// nothing.
-pub struct ReadTxn(Arc<Root>, Arc<Shared>);
+/// A reader: one revision, and the way to the data. Holding one keeps nothing
+/// alive but the database and blocks nothing.
+pub struct ReadTxn {
+    revision: Revision,
+    shared: Arc<Shared>,
+}
 
 impl ReadTxn {
-    /// The revision of the commit this snapshot was taken after.
+    /// The revision this reader reads at.
     #[must_use]
     pub fn revision(&self) -> Revision {
-        self.0.revision
-    }
-
-    /// A watch on `covers`, as this snapshot's table holds it.
-    fn cover<V: Send + Sync + 'static>(&self, table: &Table<V>, covers: Covers) -> Watch {
-        self.1.cover(table.entry(&self.0).revision, covers)
+        self.revision
     }
 }
 
-/// What one table's reads run against: the root of a [`ReadTxn`], or, for a
-/// table a [`WriteTxn`] has touched, that transaction's own pending tree.
-///
-/// The trait hands back the results rather than the tree they came from, which
-/// keeps `tree::Node` and the two tree types out of its signature.
+/// What a read runs against: the revision it reads at and, through an open
+/// transaction, the writes that transaction has buffered over it.
 trait Snapshot {
-    fn value<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<&Row<V>>;
+    /// The revision the trees are read at.
+    fn at(&self) -> Revision;
 
-    fn prefix<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        prefix: &[u8],
-    ) -> tree::Iter<'_, Row<V>>;
+    /// The revision a buffered write carries; the same as `at` for a reader.
+    fn revision(&self) -> Revision;
 
-    fn lower_bound<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        key: &[u8],
-    ) -> tree::Iter<'_, Row<V>>;
+    fn shared(&self) -> &Arc<Shared>;
 
-    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Row<V>>;
+    /// The write this transaction has buffered for `key`, if any.
+    fn buffered<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<Op<V>>;
+
+    /// Everything it has buffered for one table, in key order.
+    fn buffer<V: Send + Sync + 'static>(&self, table: &Table<V>) -> Vec<(Key, Op<V>)>;
 }
 
 impl Snapshot for ReadTxn {
-    fn value<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<&Row<V>> {
-        table.entry(&self.0).primary.get(key)
+    fn at(&self) -> Revision {
+        self.revision
     }
 
-    fn prefix<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        prefix: &[u8],
-    ) -> tree::Iter<'_, Row<V>> {
-        table.entry(&self.0).primary.prefix(prefix)
+    fn revision(&self) -> Revision {
+        self.revision
     }
 
-    fn lower_bound<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        key: &[u8],
-    ) -> tree::Iter<'_, Row<V>> {
-        table.entry(&self.0).primary.lower_bound(key)
+    fn shared(&self) -> &Arc<Shared> {
+        &self.shared
     }
 
-    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Row<V>> {
-        table.entry(&self.0).primary.iter()
+    fn buffered<V: Send + Sync + 'static>(&self, _: &Table<V>, _: &[u8]) -> Option<Op<V>> {
+        None
+    }
+
+    fn buffer<V: Send + Sync + 'static>(&self, _: &Table<V>) -> Vec<(Key, Op<V>)> {
+        Vec::new()
     }
 }
 
-/// A table this transaction has written reads from its pending tree, so the
-/// writes are there; every other table reads the root the transaction opened
-/// on. Reading opens no slot.
+/// A transaction reads its own writes: the buffer first, then the trees at the
+/// revision it opened on.
 impl Snapshot for WriteTxn<'_> {
-    fn value<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<&Row<V>> {
-        match table.opened(self) {
-            Some(pending) => pending.primary.get(key),
-            None => table.entry(&self.root).primary.get(key),
-        }
+    fn at(&self) -> Revision {
+        self.visible
     }
 
-    fn prefix<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        prefix: &[u8],
-    ) -> tree::Iter<'_, Row<V>> {
-        match table.opened(self) {
-            Some(pending) => pending.primary.prefix(prefix),
-            None => table.entry(&self.root).primary.prefix(prefix),
-        }
+    fn revision(&self) -> Revision {
+        self.revision
     }
 
-    fn lower_bound<V: Send + Sync + 'static>(
-        &self,
-        table: &Table<V>,
-        key: &[u8],
-    ) -> tree::Iter<'_, Row<V>> {
-        match table.opened(self) {
-            Some(pending) => pending.primary.lower_bound(key),
-            None => table.entry(&self.root).primary.lower_bound(key),
-        }
+    fn shared(&self) -> &Arc<Shared> {
+        &self.db.shared
     }
 
-    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Row<V>> {
-        match table.opened(self) {
-            Some(pending) => pending.primary.iter(),
-            None => table.entry(&self.root).primary.iter(),
-        }
+    fn buffered<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<Op<V>> {
+        table.opened(self)?.written(key).cloned()
+    }
+
+    fn buffer<V: Send + Sync + 'static>(&self, table: &Table<V>) -> Vec<(Key, Op<V>)> {
+        let mut buffered: Vec<(Key, Op<V>)> = table.opened(self).map_or_else(Vec::new, |buffer| {
+            buffer
+                .pending
+                .iter()
+                .map(|write| (write.key.clone(), write.op.clone()))
+                .collect()
+        });
+        buffered.sort_by(|(a, _), (b, _)| a.cmp(b));
+        buffered
     }
 }

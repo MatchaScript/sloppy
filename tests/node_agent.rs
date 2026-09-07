@@ -233,7 +233,7 @@ fn readers_keep_up_with_a_busy_writer() {
     let snapshot = db.read();
     let live: BTreeMap<Vec<u8>, u64> = table
         .all(&snapshot)
-        .map(|(v, _)| (v.key.to_vec(), v.n))
+        .map(|(_, v, _)| (v.key.to_vec(), v.n))
         .collect();
     assert_eq!(differed, live);
     assert!(live.contains_key(SENTINEL));
@@ -242,8 +242,8 @@ fn readers_keep_up_with_a_busy_writer() {
     for tenant in TENANTS {
         let want: BTreeSet<Vec<u8>> = table
             .all(&snapshot)
-            .filter(|(v, _)| v.tenant == tenant)
-            .map(|(v, _)| v.key.to_vec())
+            .filter(|(_, v, _)| v.tenant == tenant)
+            .map(|(_, v, _)| v.key.to_vec())
             .collect();
         let listed: BTreeSet<Vec<u8>> = table
             .by_index(&snapshot, "tenant", tenant.as_bytes())

@@ -85,6 +85,7 @@ fn bench(n: u64) {
         }
         txn.commit();
     }
+    db.compact(db.read().revision());
     println!("N={n} rss_kb {}", rss_kb().saturating_sub(before));
 
     // (a) One update of an existing record per commit: the plan's single
@@ -110,6 +111,7 @@ fn bench(n: u64) {
         txn.commit();
     }
     println!("N={n} insert_delete_commit {}", ns(clock.elapsed(), 10_000));
+    db.compact(db.read().revision());
 
     // (c) Point gets on one snapshot.
     let probes: Vec<Key> = (0..100_000).map(|_| key_of(rng.below(n))).collect();
@@ -153,5 +155,4 @@ fn bench(n: u64) {
         assert!(seen > 0);
     }
     println!("N={n} changes_drain {}", ns(spent, 10));
-    drop(changes);
 }

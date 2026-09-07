@@ -1,35 +1,20 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, PoisonError};
 
 use crate::tree::{self, Tree};
 
 use super::row::Row;
-use super::stream::{ChangeIterator, UNREGISTERED, revision_of, stream_key, table_of};
+use super::stream::{ChangeIterator, stream_key, table_of};
 use super::write::WriteTxn;
-use super::{Key, ReadTxn, Revision, Root, Snapshot, Version};
+use super::{Key, ReadTxn, Revision, Shared, Snapshot, Version};
 
-/// Resolves index hits through the primary tree. An index entry carries no
-/// value: the primary key is the tail of its key, past the `skip` bytes the
-/// search prefix took.
-fn resolve<'a, V>(
-    entry: &'a TableEntry<V>,
-    mut hits: tree::Iter<'a, ()>,
-    skip: usize,
-) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V> {
-    std::iter::from_fn(move || {
-        hits.next()?;
-        // A deletion drops the index entries with the value, so every hit
-        // resolves to a live row.
-        Some(
-            entry
-                .primary
-                .get(&hits.key()[skip..])
-                .and_then(Row::live)
-                .expect("index disagrees with the primary tree"),
-        )
-    })
+/// Puts `version` at the head of `key`'s chain in `tree`.
+fn write_row<V>(tree: &Tree<Row<V>>, key: &[u8], version: Version<V>, compacted: Revision) {
+    let row = Row::written(tree.get(key), version, compacted);
+    tree.insert(key, row);
 }
 
 /// A secondary index: a name and the index keys one value is listed under.
@@ -78,155 +63,140 @@ fn index_entry(index_key: &[u8], primary: &[u8]) -> Key {
     k.into()
 }
 
-/// One table's trees plus its change trackers.
-pub(super) struct TableEntry<V> {
+/// Moves `key`'s index entries from the value the row held to the one it holds
+/// now, at `revision`. An entry both values are listed under is left alone.
+/// Returns whether an entry was tombstoned.
+fn reindex<V>(
+    indexes: &[(Index<V>, Tree<Row<()>>)],
+    key: &[u8],
+    had: Option<&Arc<V>>,
+    is: Option<&Arc<V>>,
+    revision: Revision,
+    compacted: Revision,
+) -> bool {
+    let mut tombstoned = false;
+    for (def, tree) in indexes {
+        let had = had
+            .map(|value| sorted((def.keys)(value)))
+            .unwrap_or_default();
+        let is = is
+            .map(|value| sorted((def.keys)(value)))
+            .unwrap_or_default();
+        for k in had.iter().filter(|k| is.binary_search(k).is_err()) {
+            write_row(
+                tree,
+                &index_entry(k, key),
+                listed(revision, true),
+                compacted,
+            );
+            tombstoned = true;
+        }
+        for k in is.iter().filter(|k| had.binary_search(k).is_err()) {
+            write_row(
+                tree,
+                &index_entry(k, key),
+                listed(revision, false),
+                compacted,
+            );
+        }
+    }
+    tombstoned
+}
+
+/// The version an index entry takes. An entry says only that its primary key
+/// was listed at that revision; the value it resolves to is in the row.
+fn listed(revision: Revision, deleted: bool) -> Version<()> {
+    Version {
+        revision,
+        value: Arc::new(()),
+        deleted,
+    }
+}
+
+/// What a reader of one table reads without taking the writer lock.
+pub(super) struct State {
     /// Revision of the last commit that changed this table.
-    pub(super) revision: Revision,
+    pub(super) revision: AtomicU64,
+    /// Highest record revision a compaction dropped. A reader that has observed
+    /// less than this has lost a change.
+    pub(super) lost: AtomicU64,
+    /// Lowest revision a tombstone in this table sits at, or `Revision::MAX`
+    /// when it holds none. A compaction that reaches it sweeps the rows those
+    /// tombstones ended.
+    pub(super) buried: AtomicU64,
+}
+
+/// One table: the rows, the index entries, and the counters.
+pub(super) struct TableEntry<V> {
+    pub(super) state: State,
     pub(super) primary: Tree<Row<V>>,
     /// One tree per registered index, in registration order. The key is
     /// `index_entry(index key, primary key)` and there is no value.
-    indexes: Vec<(Index<V>, Tree<()>)>,
-    trackers: Vec<Weak<AtomicU64>>,
-    /// Highest delete revision that [`Db::compact`] removed before every
-    /// tracker had seen it. A reader below this has lost a change.
-    pub(super) lost: Revision,
-    /// Lowest revision a tombstoned row is left at, or `Revision::MAX` when
-    /// none is left. A sweep is due once a bound reaches it; see
-    /// [`AnyTable::collected`]. Rewriting a tombstoned key leaves it low, and
-    /// the next sweep puts it right.
-    buried: Revision,
-    primary_key: fn(&V) -> Key,
+    pub(super) indexes: Vec<(Index<V>, Tree<Row<()>>)>,
+    pub(super) primary_key: fn(&V) -> Key,
 }
 
 impl<V> TableEntry<V> {
     pub(super) fn new(primary_key: fn(&V) -> Key, indexes: Vec<Index<V>>) -> Self {
         Self {
-            revision: 0,
+            state: State {
+                revision: AtomicU64::new(0),
+                lost: AtomicU64::new(0),
+                buried: AtomicU64::new(Revision::MAX),
+            },
             primary: Tree::new(),
             indexes: indexes.into_iter().map(|def| (def, Tree::new())).collect(),
-            trackers: Vec::new(),
-            lost: 0,
-            buried: Revision::MAX,
             primary_key,
         }
     }
 }
 
-/// What one table's change readers hold back.
-pub(super) struct Readers {
-    pub(super) trackers: Vec<Weak<AtomicU64>>,
-    /// The lowest revision every reader has observed; with no reader left, the
-    /// table's own revision, so everything it has may go.
-    pub(super) watermark: Revision,
-    /// A tracker whose reader is gone was dropped.
-    pub(super) pruned: bool,
-    pub(super) lost: Revision,
-}
-
-/// The type-erased face of `TableEntry<V>`: what the `Root` can do without
-/// knowing the value type.
+/// The type-erased face of `TableEntry<V>`: what the `Db` can do to a table
+/// without knowing its value type.
 pub(super) trait AnyTable: Any + Send + Sync {
-    fn readers(&self) -> Readers;
+    fn state(&self) -> &State;
 
-    /// A copy with the trackers pruned, `lost` raised, and the rows a tombstone
-    /// at or below `dead` ended dropped.
-    fn collected(
-        &self,
-        trackers: Vec<Weak<AtomicU64>>,
-        lost: Revision,
-        dead: Revision,
-    ) -> Arc<dyn AnyTable>;
-
-    /// The lowest revision a tombstoned row is left at.
-    fn buried(&self) -> Revision;
-
-    /// The revision of the last commit that changed this table.
-    fn revision(&self) -> Revision;
+    /// Removes the rows and index entries a tombstone at or below `rev` ended,
+    /// and leaves `buried` at the lowest tombstone that survives.
+    fn sweep(&self, rev: Revision);
 }
 
 impl<V: Send + Sync + 'static> AnyTable for TableEntry<V> {
-    fn readers(&self) -> Readers {
-        let mut trackers = Vec::with_capacity(self.trackers.len());
-        let mut watermark = Revision::MAX;
-        for weak in &self.trackers {
-            if let Some(tracker) = weak.upgrade() {
-                watermark = watermark.min(tracker.load(Ordering::Relaxed));
-                trackers.push(weak.clone());
-            }
+    fn state(&self) -> &State {
+        &self.state
+    }
+
+    fn sweep(&self, rev: Revision) {
+        let mut buried = swept(&self.primary, rev);
+        for (_, tree) in &self.indexes {
+            buried = buried.min(swept(tree, rev));
         }
-        Readers {
-            pruned: trackers.len() != self.trackers.len(),
-            watermark: if trackers.is_empty() {
-                self.revision
-            } else {
-                watermark
-            },
-            trackers,
-            lost: self.lost,
-        }
-    }
-
-    fn collected(
-        &self,
-        trackers: Vec<Weak<AtomicU64>>,
-        lost: Revision,
-        dead: Revision,
-    ) -> Arc<dyn AnyTable> {
-        let (primary, buried) = if dead >= self.buried {
-            swept(&self.primary, dead)
-        } else {
-            (self.primary.clone(), self.buried)
-        };
-        Arc::new(TableEntry {
-            revision: self.revision,
-            primary,
-            indexes: self.indexes.clone(),
-            trackers,
-            lost,
-            buried,
-            primary_key: self.primary_key,
-        })
-    }
-
-    fn buried(&self) -> Revision {
-        self.buried
-    }
-
-    fn revision(&self) -> Revision {
-        self.revision
+        self.state.buried.store(buried, Ordering::Release);
     }
 }
 
-/// The primary tree without the rows a tombstone at or below `dead` ended, and
-/// the lowest revision the tombstoned rows it leaves are at.
-///
-/// Their deletion has reached every reader and is below the compaction bound,
-/// so nothing may ask for the key or its versions again.
-// ponytail: one walk of the whole tree, run only when a tombstone is at or
-// below the bound. Hold the tombstoned keys in the entry if a workload deletes
-// often enough for the walk to show up.
-fn swept<V>(primary: &Tree<Row<V>>, dead: Revision) -> (Tree<Row<V>>, Revision) {
-    let mut doomed: Vec<Key> = Vec::new();
+/// Removes every row a tombstone at or below `rev` ended and returns the lowest
+/// tombstone revision the tree is left with. Their deletion is below the
+/// compaction bound, so nothing may ask for the key or its versions again.
+// ponytail: one walk of the whole tree, run only when a tombstone has reached
+// the bound. Hold the tombstoned keys in the entry if a workload deletes often
+// enough for the walk to show up.
+fn swept<V>(tree: &Tree<Row<V>>, rev: Revision) -> Revision {
     let mut buried = Revision::MAX;
-    let mut it = primary.iter();
-    while let Some(row) = it.next() {
-        let newest = row.newest();
-        if newest.deleted {
-            if newest.revision <= dead {
-                doomed.push(it.key().into());
+    let mut doomed = Vec::new();
+    for (key, row) in tree.range_from(&[]) {
+        if let Some(revision) = row.tombstoned() {
+            if revision <= rev {
+                doomed.push(key);
             } else {
-                buried = buried.min(newest.revision);
+                buried = buried.min(revision);
             }
         }
     }
-    if doomed.is_empty() {
-        return (primary.clone(), buried);
-    }
-    let mut txn = primary.txn();
     for key in &doomed {
-        txn.delete(key);
+        tree.remove(key);
     }
-    (txn.commit(), buried)
+    buried
 }
 
 /// A handle to a registered table. Cheap to copy; valid only for the `Db` that
@@ -246,13 +216,57 @@ impl<V> Clone for Table<V> {
 
 impl<V> Copy for Table<V> {}
 
+/// The rows of one table read at `at`, with the writes a transaction buffered
+/// over them at `revision`, in key order. A buffered key stands in for the row.
+fn merged<V>(
+    rows: tree::Iter<Row<V>>,
+    buffered: Vec<(Key, Op<V>)>,
+    at: Revision,
+    revision: Revision,
+) -> impl Iterator<Item = (Key, Arc<V>, Revision)> + use<V> {
+    let mut rows = rows.peekable();
+    let mut buffered = buffered.into_iter().peekable();
+    std::iter::from_fn(move || {
+        loop {
+            let take_buffered = match (rows.peek(), buffered.peek()) {
+                (None, None) => return None,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (Some((row, _)), Some((key, _))) => key <= row,
+            };
+            let live = if take_buffered {
+                let (key, op) = buffered.next().expect("just peeked");
+                if rows.peek().is_some_and(|(row, _)| *row == key) {
+                    rows.next();
+                }
+                let version = op.newest(revision);
+                (!version.deleted).then_some((key, version.value, version.revision))
+            } else {
+                let (key, row) = rows.next().expect("just peeked");
+                row.live(at).map(|(value, revision)| (key, value, revision))
+            };
+            if live.is_some() {
+                return live;
+            }
+        }
+    })
+}
+
 impl<V: Send + Sync + 'static> Table<V> {
-    pub(super) fn entry<'a>(&self, root: &'a Root) -> &'a TableEntry<V> {
-        root.tables
+    /// Runs `f` on this table's entry, under the read lock that holds the table
+    /// list still.
+    ///
+    /// # Panics
+    ///
+    /// If the table was not registered in this `Db`.
+    pub(super) fn with<R>(&self, shared: &Shared, f: impl FnOnce(&TableEntry<V>) -> R) -> R {
+        let tables = shared.tables.read().unwrap_or_else(PoisonError::into_inner);
+        let entry = tables
             .get(self.pos)
-            .filter(|_| root.db == self.db)
-            .and_then(|t| (&**t as &dyn Any).downcast_ref())
-            .unwrap_or_else(|| panic!("table {} belongs to another Db or value type", self.name))
+            .filter(|_| shared.db == self.db)
+            .and_then(|table| (&**table as &dyn Any).downcast_ref())
+            .unwrap_or_else(|| panic!("table {} belongs to another Db or value type", self.name));
+        f(entry)
     }
 
     #[must_use]
@@ -260,31 +274,22 @@ impl<V: Send + Sync + 'static> Table<V> {
         self.name
     }
 
-    /// The revision of the last commit that changed this table.
+    /// The revision of the last commit that changed this table. The table
+    /// holds where it stands, not a revision per reader, so a reader that has
+    /// fallen behind is told of a commit past its own revision.
     ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
     #[must_use]
     pub fn revision(&self, txn: &ReadTxn) -> Revision {
-        self.entry(&txn.0).revision
+        self.with(&txn.shared, |entry| {
+            entry.state.revision.load(Ordering::Acquire)
+        })
     }
 
-    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
-    /// writes.
-    ///
-    /// # Panics
-    ///
-    /// If the table was not registered in this `Db`.
-    #[allow(private_bounds)]
-    #[must_use]
-    pub fn get<'a>(&self, txn: &'a impl Snapshot, key: &[u8]) -> Option<(&'a V, Revision)> {
-        txn.value(self, key)?.live()
-    }
-
-    /// Every version of `key` this database still holds, oldest first, ending
-    /// with a tombstone if the key was deleted. Empty if the key was never
-    /// written, or if its row has been collected.
+    /// The value at `key` and the revision of the commit that wrote it, unless
+    /// the version this reader sees is a tombstone.
     ///
     /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
     /// writes.
@@ -294,10 +299,22 @@ impl<V: Send + Sync + 'static> Table<V> {
     /// If the table was not registered in this `Db`.
     #[allow(private_bounds)]
     #[must_use]
-    pub fn versions<'a>(&self, txn: &'a impl Snapshot, key: &[u8]) -> &'a [Version<V>] {
-        txn.value(self, key).map_or(&[], |row| &row.versions)
+    pub fn get(&self, txn: &impl Snapshot, key: &[u8]) -> Option<(Arc<V>, Revision)> {
+        match txn.buffered(self, key) {
+            Some(op) => {
+                let version = op.newest(txn.revision());
+                (!version.deleted).then_some((version.value, version.revision))
+            }
+            None => self
+                .with(txn.shared(), |entry| entry.primary.get(key))
+                .and_then(|row| row.live(txn.at())),
+        }
     }
 
+    /// Every version of `key` this reader can see, oldest first, ending with a
+    /// tombstone if the key was deleted. Empty if the key was never written, or
+    /// if its row has been swept.
+    ///
     /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
     /// writes.
     ///
@@ -305,12 +322,26 @@ impl<V: Send + Sync + 'static> Table<V> {
     ///
     /// If the table was not registered in this `Db`.
     #[allow(private_bounds)]
-    pub fn prefix<'a, S: Snapshot>(
-        &self,
-        txn: &'a S,
-        prefix: &[u8],
-    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V, S> {
-        txn.prefix(self, prefix).filter_map(Row::live)
+    #[must_use]
+    pub fn versions(&self, txn: &impl Snapshot, key: &[u8]) -> Vec<Version<V>> {
+        let stored = || {
+            self.with(txn.shared(), |entry| entry.primary.get(key))
+                .map(|row| row.versions(txn.at()))
+                .unwrap_or_default()
+        };
+        match txn.buffered(self, key) {
+            None => stored(),
+            Some(Op::Load(versions)) => versions,
+            Some(Op::Write { value, deleted }) => {
+                let mut versions = stored();
+                versions.push(Version {
+                    revision: txn.revision(),
+                    value,
+                    deleted,
+                });
+                versions
+            }
+        }
     }
 
     /// Every entry with a key `>= key`, in order.
@@ -322,40 +353,16 @@ impl<V: Send + Sync + 'static> Table<V> {
     ///
     /// If the table was not registered in this `Db`.
     #[allow(private_bounds)]
-    pub fn lower_bound<'a, S: Snapshot>(
+    pub fn lower_bound<S: Snapshot>(
         &self,
-        txn: &'a S,
+        txn: &S,
         key: &[u8],
-    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V, S> {
-        txn.lower_bound(self, key).filter_map(Row::live)
+    ) -> impl Iterator<Item = (Key, Arc<V>, Revision)> + use<V, S> {
+        self.scan(txn, key)
     }
 
-    /// Every entry listed under `key` in the named index, resolved through the
-    /// primary tree.
+    /// Every entry whose key starts with `prefix`, in order.
     ///
-    /// # Panics
-    ///
-    /// If the table was not registered in this `Db`, or has no such index.
-    pub fn by_index<'a>(
-        &self,
-        txn: &'a ReadTxn,
-        index: &'static str,
-        key: &[u8],
-    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V> {
-        let entry = self.entry(&txn.0);
-        let prefix = index_prefix(key);
-        let hits = self.index_tree(entry, index).prefix(&prefix);
-        resolve(entry, hits, prefix.len())
-    }
-
-    fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<()> {
-        entry
-            .indexes
-            .iter()
-            .find_map(|(def, tree)| (def.name == index).then_some(tree))
-            .unwrap_or_else(|| panic!("table {} has no index {index}", self.name))
-    }
-
     /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
     /// writes.
     ///
@@ -363,78 +370,112 @@ impl<V: Send + Sync + 'static> Table<V> {
     ///
     /// If the table was not registered in this `Db`.
     #[allow(private_bounds)]
-    pub fn all<'a, S: Snapshot>(
+    pub fn prefix<S: Snapshot>(
         &self,
-        txn: &'a S,
-    ) -> impl Iterator<Item = (&'a V, Revision)> + use<'a, V, S> {
-        txn.all(self).filter_map(Row::live)
+        txn: &S,
+        prefix: &[u8],
+    ) -> impl Iterator<Item = (Key, Arc<V>, Revision)> + use<V, S> {
+        let prefix: Key = prefix.into();
+        self.scan(txn, &prefix)
+            .take_while(move |(key, _, _)| key.starts_with(&prefix))
     }
 
-    /// The revisions of the change records this table still holds, in stream
-    /// order. Test helper.
+    /// Every entry, in key order.
+    ///
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
     ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn held_records(&self, txn: &ReadTxn) -> Vec<Revision> {
-        let mut it = txn.0.changes.lower_bound(&stream_key(self.pos, 0, 0));
-        let mut held = Vec::new();
-        while it.next().is_some() {
-            if table_of(it.key()) != self.pos {
-                break;
-            }
-            held.push(revision_of(it.key()));
-        }
-        held
+    #[allow(private_bounds)]
+    pub fn all<S: Snapshot>(
+        &self,
+        txn: &S,
+    ) -> impl Iterator<Item = (Key, Arc<V>, Revision)> + use<V, S> {
+        self.scan(txn, &[])
+    }
+
+    fn scan<S: Snapshot>(
+        &self,
+        txn: &S,
+        from: &[u8],
+    ) -> impl Iterator<Item = (Key, Arc<V>, Revision)> + use<V, S> {
+        let rows = self.with(txn.shared(), |entry| entry.primary.range_from(from));
+        let buffered = txn
+            .buffer(self)
+            .into_iter()
+            .skip_while(|(key, _)| **key < *from)
+            .collect();
+        merged(rows, buffered, txn.at(), txn.revision())
+    }
+
+    /// Every value listed under `key` in the named index, in primary key order,
+    /// resolved through the row each entry names.
+    ///
+    /// # Panics
+    ///
+    /// If the table was not registered in this `Db`, or has no such index.
+    pub fn by_index(
+        &self,
+        txn: &ReadTxn,
+        index: &'static str,
+        key: &[u8],
+    ) -> impl Iterator<Item = (Arc<V>, Revision)> + use<V> {
+        let at = txn.revision;
+        let prefix = index_prefix(key);
+        let listed = self.with(&txn.shared, |entry| {
+            self.index_tree(entry, index)
+                .range_from(&prefix)
+                .take_while(|(entry_key, _)| entry_key.starts_with(&prefix))
+                .filter(|(_, listing)| listing.at(at).is_some_and(|v| !v.deleted))
+                .filter_map(|(entry_key, _)| entry.primary.get(&entry_key[prefix.len()..]))
+                .filter_map(|row| row.live(at))
+                .collect::<Vec<_>>()
+        });
+        listed.into_iter()
+    }
+
+    fn index_tree<'a>(&self, entry: &'a TableEntry<V>, index: &'static str) -> &'a Tree<Row<()>> {
+        entry
+            .indexes
+            .iter()
+            .find_map(|(def, tree)| (def.name == index).then_some(tree))
+            .unwrap_or_else(|| panic!("table {} has no index {index}", self.name))
     }
 
     /// Whether this table's run of the change stream holds a record.
-    fn recorded(&self, root: &Root) -> bool {
-        let mut it = root.changes.lower_bound(&stream_key(self.pos, 0, 0));
-        it.next().is_some() && table_of(it.key()) == self.pos
+    fn recorded(&self, shared: &Shared) -> bool {
+        shared
+            .changes
+            .range_from(&stream_key(self.pos, 0, 0))
+            .next()
+            .is_some_and(|(key, _)| table_of(&key) == self.pos)
     }
 
-    /// The working copy of this table, if this transaction has opened one. A
-    /// handle from another `Db` reads no slot: it falls through to `entry`,
+    /// The writes this transaction has buffered for this table, if it has any.
+    /// A handle from another `Db` reads no slot: it falls through to `with`,
     /// which is where the mismatch is reported.
-    pub(super) fn opened<'t>(&self, txn: &'t WriteTxn<'_>) -> Option<&'t Pending<V>> {
-        let pending = txn
-            .pending
+    pub(super) fn opened<'t>(&self, txn: &'t WriteTxn<'_>) -> Option<&'t Buffer<V>> {
+        let buffer = txn
+            .buffers
             .get(self.pos)
-            .filter(|_| txn.root.db == self.db)?
+            .filter(|_| txn.db.shared.db == self.db)?
             .as_ref()?;
         Some(
-            (&**pending as &dyn Any)
+            (&**buffer as &dyn Any)
                 .downcast_ref()
-                .expect("pending table opened with another value type"),
+                .expect("a table's buffer holds its value type"),
         )
     }
 
-    /// The working copy of this table, opened on first use.
-    fn pending<'t>(&self, txn: &'t mut WriteTxn<'_>) -> &'t mut Pending<V> {
-        let entry = self.entry(&txn.root);
-        let pending = txn.pending[self.pos].get_or_insert_with(|| {
-            Box::new(Pending {
-                revision: entry.revision,
-                written: false,
-                primary: entry.primary.txn(),
-                indexes: entry
-                    .indexes
-                    .iter()
-                    .map(|(def, tree)| (*def, tree.txn()))
-                    .collect(),
-                trackers: entry.trackers.clone(),
-                new_trackers: Vec::new(),
-                lost: entry.lost,
-                buried: entry.buried,
-                primary_key: entry.primary_key,
-            })
-        });
-        (&mut **pending as &mut dyn Any)
+    /// This table's buffer, opened on first use.
+    fn buffer<'t>(&self, txn: &'t mut WriteTxn<'_>) -> &'t mut Buffer<V> {
+        let buffer = txn.buffers[self.pos].get_or_insert_with(|| Box::new(Buffer::<V>::default()));
+        txn.dirty = true;
+        (&mut **buffer as &mut dyn Any)
             .downcast_mut()
-            .expect("pending table opened with another value type")
+            .expect("a table's buffer holds its value type")
     }
 
     /// Writes `value` under `primary_key(&value)` and returns what it replaced.
@@ -443,78 +484,34 @@ impl<V: Send + Sync + 'static> Table<V> {
     ///
     /// If the table was not registered in this `Db`.
     pub fn insert(&self, txn: &mut WriteTxn<'_>, value: V) -> Option<Arc<V>> {
-        let (revision, compacted) = (txn.revision, txn.root.compacted);
-        txn.dirty = true;
         let value = Arc::new(value);
-        let (key, was, first) = {
-            let pending = self.pending(txn);
-            pending.written = true;
-            let key = (pending.primary_key)(&value);
-            let was = pending.primary.get(&key).and_then(Row::held).cloned();
-            let version = Version {
-                revision,
-                value: value.clone(),
+        let key = self.with(&txn.db.shared, |entry| (entry.primary_key)(&value));
+        let was = self.get(txn, &key).map(|(value, _)| value);
+        self.buffer(txn).put(
+            key,
+            Op::Write {
+                value,
                 deleted: false,
-            };
-            let (row, first) = Row::written(pending.primary.get(&key), version, compacted);
-            pending.primary.insert(&key, row);
-            for (def, tree) in &mut pending.indexes {
-                // Only the difference of the two key sets touches the tree, so
-                // an update that keeps a value listed under the same index key
-                // leaves that entry alone.
-                let had = was
-                    .as_ref()
-                    .map(|was| sorted((def.keys)(was)))
-                    .unwrap_or_default();
-                let is = sorted((def.keys)(&value));
-                for k in had.iter().filter(|k| is.binary_search(k).is_err()) {
-                    tree.delete(&index_entry(k, &key));
-                }
-                for k in is.iter().filter(|k| had.binary_search(k).is_err()) {
-                    tree.insert(&index_entry(k, &key), ());
-                }
-            }
-            (key, was, first)
-        };
-        if first {
-            let seq = txn.take_seq();
-            txn.record(self.pos, revision, seq, key);
-        }
+            },
+        );
         was
     }
 
     /// Ends the row with a tombstone that keeps the value, and returns it. The
-    /// key reads as absent from here on; the row stays until it is collected.
+    /// key reads as absent from here on; the row stays until it is swept.
     ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
     pub fn delete(&self, txn: &mut WriteTxn<'_>, key: &[u8]) -> Option<Arc<V>> {
-        let (revision, compacted) = (txn.revision, txn.root.compacted);
-        let (old, first) = {
-            let pending = self.pending(txn);
-            let old = pending.primary.get(key).and_then(Row::held)?.clone();
-            let version = Version {
-                revision,
+        let old = self.get(txn, key).map(|(value, _)| value)?;
+        self.buffer(txn).put(
+            key.into(),
+            Op::Write {
                 value: old.clone(),
                 deleted: true,
-            };
-            let (row, first) = Row::written(pending.primary.get(key), version, compacted);
-            pending.primary.insert(key, row);
-            pending.written = true;
-            pending.buried = pending.buried.min(revision);
-            for (def, tree) in &mut pending.indexes {
-                for k in (def.keys)(&old) {
-                    tree.delete(&index_entry(&k, key));
-                }
-            }
-            (old, first)
-        };
-        txn.dirty = true;
-        if first {
-            let seq = txn.take_seq();
-            txn.record(self.pos, revision, seq, key.into());
-        }
+            },
+        );
         Some(old)
     }
 
@@ -524,6 +521,10 @@ impl<V: Send + Sync + 'static> Table<V> {
     ///
     /// The indexes follow the newest version, so a row loaded as deleted is
     /// listed nowhere.
+    ///
+    /// A rebuild runs with no reader open. The loaded versions keep the
+    /// revisions they were written at, which are at or below what an open
+    /// reader reads, so such a reader would see the rows this call puts back.
     ///
     /// The table must hold no change record. A record is resolved through the
     /// row it names, and the loaded versions need not hold the revision it was
@@ -537,7 +538,7 @@ impl<V: Send + Sync + 'static> Table<V> {
     pub fn load(&self, txn: &mut WriteTxn<'_>, key: &[u8], versions: Vec<Version<V>>) {
         let newest = versions.last().expect("a loaded row holds a version");
         assert!(
-            !self.recorded(&txn.root),
+            !self.recorded(&txn.db.shared),
             "table {} holds change records a loaded row would strand",
             self.name
         );
@@ -551,92 +552,179 @@ impl<V: Send + Sync + 'static> Table<V> {
             versions.iter().is_sorted_by(|a, b| a.revision < b.revision),
             "loaded versions are not in ascending revision order"
         );
-        let tombstoned = newest.deleted.then_some(newest.revision);
-        txn.dirty = true;
-        let pending = self.pending(txn);
-        pending.written = true;
-        if let Some(revision) = tombstoned {
-            pending.buried = pending.buried.min(revision);
-        }
-        let was = pending.primary.get(key).and_then(Row::held).cloned();
-        let row = Row {
-            versions: versions.into(),
-        };
-        let is = row.held().cloned();
-        pending.primary.insert(key, row);
-        for (def, tree) in &mut pending.indexes {
-            for k in was.iter().flat_map(|was| (def.keys)(was)) {
-                tree.delete(&index_entry(&k, key));
-            }
-            for k in is.iter().flat_map(|is| (def.keys)(is)) {
-                tree.insert(&index_entry(&k, key), ());
-            }
-        }
+        self.buffer(txn).put(key.into(), Op::Load(versions));
     }
 
-    /// Registers a change reader that observes this table as of the commit that
-    /// installs it. The returned reader may only be used after `txn` commits;
-    /// until then it holds nothing back.
+    /// A reader of this table's changes, observing it from where it stands now:
+    /// what this transaction and every later one write is reported.
     ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
     pub fn changes(&self, txn: &mut WriteTxn<'_>) -> ChangeIterator<V> {
-        let pending = self.pending(txn);
-        let tracker = Arc::new(AtomicU64::new(UNREGISTERED));
-        pending.new_trackers.push(tracker.clone());
+        let observed = self.with(&txn.db.shared, |entry| {
+            entry.state.revision.load(Ordering::Acquire)
+        });
         ChangeIterator {
             table: *self,
-            tracker,
+            observed,
         }
     }
 }
 
-/// One table's uncommitted trees.
+/// One buffered write.
 pub(super) struct Pending<V> {
-    /// The table's revision before this transaction.
-    revision: Revision,
-    written: bool,
-    pub(super) primary: tree::Txn<Row<V>>,
-    indexes: Vec<(Index<V>, tree::Txn<()>)>,
-    trackers: Vec<Weak<AtomicU64>>,
-    new_trackers: Vec<Arc<AtomicU64>>,
-    lost: Revision,
-    buried: Revision,
-    primary_key: fn(&V) -> Key,
+    pub(super) key: Key,
+    pub(super) op: Op<V>,
 }
 
-pub(super) trait AnyPending: Any {
-    /// Builds the new table entry, at `revision` if this table was written.
-    fn install(self: Box<Self>, revision: Revision) -> Arc<dyn AnyTable>;
+/// What a transaction leaves at a key.
+pub(super) enum Op<V> {
+    /// An insert or a delete: one version, at the transaction's revision.
+    Write { value: Arc<V>, deleted: bool },
+    /// A load: the whole chain, in place of what is there.
+    Load(Vec<Version<V>>),
 }
 
-impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
-    fn install(self: Box<Self>, revision: Revision) -> Arc<dyn AnyTable> {
-        let this = *self;
-        let revision = if this.written {
-            revision
-        } else {
-            this.revision
-        };
-        let mut trackers = this.trackers;
-        for tracker in this.new_trackers {
-            tracker.store(revision, Ordering::Relaxed);
-            trackers.push(Arc::downgrade(&tracker));
+impl<V> Clone for Op<V> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Write { value, deleted } => Self::Write {
+                value: value.clone(),
+                deleted: *deleted,
+            },
+            Self::Load(versions) => Self::Load(versions.clone()),
         }
-        let indexes = this
-            .indexes
-            .into_iter()
-            .map(|(def, txn)| (def, txn.commit()))
-            .collect();
-        Arc::new(TableEntry {
-            revision,
-            primary: this.primary.commit(),
-            indexes,
-            trackers,
-            lost: this.lost,
-            buried: this.buried,
-            primary_key: this.primary_key,
-        })
+    }
+}
+
+impl<V> Op<V> {
+    /// The version this write leaves at the head of the row.
+    pub(super) fn newest(&self, revision: Revision) -> Version<V> {
+        match self {
+            Self::Write { value, deleted } => Version {
+                revision,
+                value: value.clone(),
+                deleted: *deleted,
+            },
+            Self::Load(versions) => versions
+                .last()
+                .expect("a loaded row holds a version")
+                .clone(),
+        }
+    }
+}
+
+/// One table's buffered writes, in the order they were made.
+pub(super) struct Buffer<V> {
+    pub(super) pending: Vec<Pending<V>>,
+    /// Where each key's write sits, so a second write of one key replaces the
+    /// first where it stands rather than following it.
+    at: HashMap<Key, usize>,
+}
+
+impl<V> Default for Buffer<V> {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            at: HashMap::new(),
+        }
+    }
+}
+
+impl<V> Buffer<V> {
+    fn put(&mut self, key: Key, op: Op<V>) {
+        if let Some(&at) = self.at.get(&key) {
+            self.pending[at].op = op;
+        } else {
+            self.at.insert(key.clone(), self.pending.len());
+            self.pending.push(Pending { key, op });
+        }
+    }
+
+    pub(super) fn written(&self, key: &[u8]) -> Option<&Op<V>> {
+        self.at.get(key).map(|&at| &self.pending[at].op)
+    }
+}
+
+/// What a commit is applying, as it walks the tables in order.
+pub(super) struct Applying<'a> {
+    pub(super) revision: Revision,
+    pub(super) compacted: Revision,
+    /// The table the current buffer belongs to.
+    pub(super) pos: usize,
+    /// The place the next record takes in this commit.
+    pub(super) seq: u32,
+    pub(super) changes: &'a Tree<Key>,
+}
+
+/// The type-erased face of `Buffer<V>`: what a commit does with one without
+/// knowing the value type.
+pub(super) trait AnyBuffer: Any {
+    /// Writes everything this buffer holds to `table`, in order.
+    fn apply(self: Box<Self>, table: &dyn AnyTable, at: &mut Applying<'_>);
+}
+
+impl<V: Send + Sync + 'static> AnyBuffer for Buffer<V> {
+    fn apply(self: Box<Self>, table: &dyn AnyTable, at: &mut Applying<'_>) {
+        let entry: &TableEntry<V> = (table as &dyn Any)
+            .downcast_ref()
+            .expect("a table's buffer holds its value type");
+        let mut buried = Revision::MAX;
+        for Pending { key, op } in self.pending {
+            let row = entry.primary.get(&key);
+            let had = row.as_ref().and_then(Row::held).cloned();
+            match op {
+                Op::Write { value, deleted } => {
+                    let is = (!deleted).then(|| value.clone());
+                    if deleted {
+                        buried = buried.min(at.revision);
+                    }
+                    if reindex(
+                        &entry.indexes,
+                        &key,
+                        had.as_ref(),
+                        is.as_ref(),
+                        at.revision,
+                        at.compacted,
+                    ) {
+                        buried = buried.min(at.revision);
+                    }
+                    let version = Version {
+                        revision: at.revision,
+                        value,
+                        deleted,
+                    };
+                    entry
+                        .primary
+                        .insert(&key, Row::written(row, version, at.compacted));
+                    at.changes
+                        .insert(&stream_key(at.pos, at.revision, at.seq), key);
+                    at.seq += 1;
+                }
+                Op::Load(versions) => {
+                    let loaded = Row::loaded(&versions);
+                    if let Some(revision) = loaded.tombstoned() {
+                        buried = buried.min(revision);
+                    }
+                    let revision = loaded.newest().revision;
+                    if reindex(
+                        &entry.indexes,
+                        &key,
+                        had.as_ref(),
+                        loaded.held(),
+                        revision,
+                        at.compacted,
+                    ) {
+                        buried = buried.min(revision);
+                    }
+                    entry.primary.insert(&key, loaded);
+                }
+            }
+        }
+        entry.state.revision.store(at.revision, Ordering::Release);
+        if buried < Revision::MAX {
+            entry.state.buried.fetch_min(buried, Ordering::AcqRel);
+        }
     }
 }
