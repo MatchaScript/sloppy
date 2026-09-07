@@ -584,8 +584,8 @@ impl<V: Send + Sync + 'static> Table<V> {
     /// The working copy of this table, opened on first use.
     fn pending<'t>(&self, txn: &'t mut WriteTxn<'_>) -> &'t mut Pending<V> {
         let entry = self.entry(&txn.root);
-        if txn.pending[self.pos].is_none() {
-            let pending = Pending {
+        let pending = txn.pending[self.pos].get_or_insert_with(|| {
+            Box::new(Pending {
                 revision: entry.revision,
                 written: false,
                 primary: entry.primary.txn(),
@@ -598,12 +598,9 @@ impl<V: Send + Sync + 'static> Table<V> {
                 new_trackers: Vec::new(),
                 lost: entry.lost,
                 primary_key: entry.primary_key,
-            };
-            txn.pending[self.pos] = Some(Box::new(pending));
-        }
-        (txn.pending[self.pos]
-            .as_deref_mut()
-            .expect("just opened") as &mut dyn Any)
+            })
+        });
+        (&mut **pending as &mut dyn Any)
             .downcast_mut()
             .expect("pending table opened with another value type")
     }
