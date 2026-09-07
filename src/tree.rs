@@ -675,6 +675,98 @@ fn descend<'a, V>(root: &'a Arc<Node<V>>, key: &[u8]) -> (Option<&'a Arc<V>>, &'
     }
 }
 
+/// The entries under `p` and the node covering them.
+fn prefix_covering<'a, V>(root: &'a Node<V>, p: &[u8]) -> (Iter<'a, V>, &'a Node<V>) {
+    let mut node = root;
+    let mut key = Vec::new();
+    let mut rest = p;
+    loop {
+        if node.prefix.len() >= rest.len() {
+            let stack = if node.prefix.starts_with(rest) {
+                vec![Frame {
+                    node,
+                    len: key.len(),
+                }]
+            } else {
+                Vec::new()
+            };
+            return (Iter { path: key, stack }, node);
+        }
+        if !rest.starts_with(&node.prefix) {
+            break;
+        }
+        key.extend_from_slice(&node.prefix);
+        rest = &rest[node.prefix.len()..];
+        match node.children.get(rest[0]) {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    (
+        Iter {
+            path: Vec::new(),
+            stack: Vec::new(),
+        },
+        node,
+    )
+}
+
+/// Every entry with a key `>= key`, in order. Descends along `key` and seeds
+/// the stack with the subtrees that are entirely `>= key`.
+fn lower_bound<'a, V>(root: &'a Node<V>, key: &[u8]) -> Iter<'a, V> {
+    let mut stack = Vec::new();
+    let mut node = root;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut rest = key;
+    loop {
+        let n = node.prefix.len().min(rest.len());
+        match node.prefix[..n].cmp(&rest[..n]) {
+            // The whole subtree sorts below `key`.
+            Ordering::Less => break,
+            // The whole subtree sorts above `key`.
+            Ordering::Greater => {
+                stack.push(Frame {
+                    node,
+                    len: acc.len(),
+                });
+                break;
+            }
+            Ordering::Equal => {}
+        }
+        if node.prefix.len() >= rest.len() {
+            // `key` runs out inside this node, so its whole subtree is >= key.
+            stack.push(Frame {
+                node,
+                len: acc.len(),
+            });
+            break;
+        }
+        // This node's own key is a strict prefix of `key`, so it sorts below
+        // `key` and is skipped, as are the children before `rest[0]`.
+        acc.extend_from_slice(&node.prefix);
+        rest = &rest[node.prefix.len()..];
+        for child in node.children.split(rest[0]).1.iter().rev().flatten() {
+            stack.push(Frame {
+                node: child,
+                len: acc.len(),
+            });
+        }
+        match node.children.get(rest[0]) {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    Iter { path: acc, stack }
+}
+
+/// Every entry of this subtree, in ascending key order.
+fn walk<V>(root: &Node<V>) -> Iter<'_, V> {
+    Iter {
+        path: Vec::new(),
+        stack: vec![Frame { node: root, len: 0 }],
+    }
+}
+
 /// An immutable snapshot. `clone` is one `Arc` bump.
 pub struct Tree<V> {
     root: Arc<Node<V>>,
@@ -746,103 +838,23 @@ impl<V> Tree<V> {
         (value, watch)
     }
 
-    /// Every entry whose key starts with `p`, plus the watch of the node the
-    /// descent along `p` reaches.
+    /// Every entry whose key starts with `p`.
     #[must_use]
     pub fn prefix(&self, p: &[u8]) -> Iter<'_, V> {
-        self.prefix_covering(p).0
+        prefix_covering(&self.root, p).0
     }
 
     /// The same, plus the watch of the node the descent along `p` reaches.
     #[must_use]
     pub fn prefix_watch(&self, p: &[u8]) -> (Iter<'_, V>, Watch) {
-        let (iter, node) = self.prefix_covering(p);
+        let (iter, node) = prefix_covering(&self.root, p);
         (iter, node.subtree.watch())
     }
 
-    /// The entries under `p` and the node covering them, without a watch.
-    fn prefix_covering(&self, p: &[u8]) -> (Iter<'_, V>, &Node<V>) {
-        let mut node: &Node<V> = &self.root;
-        let mut key = Vec::new();
-        let mut rest = p;
-        loop {
-            if node.prefix.len() >= rest.len() {
-                let stack = if node.prefix.starts_with(rest) {
-                    vec![Frame {
-                        node,
-                        len: key.len(),
-                    }]
-                } else {
-                    Vec::new()
-                };
-                return (Iter { path: key, stack }, node);
-            }
-            if !rest.starts_with(&node.prefix) {
-                break;
-            }
-            key.extend_from_slice(&node.prefix);
-            rest = &rest[node.prefix.len()..];
-            match node.children.get(rest[0]) {
-                Some(child) => node = child,
-                None => break,
-            }
-        }
-        (
-            Iter {
-                path: Vec::new(),
-                stack: Vec::new(),
-            },
-            node,
-        )
-    }
-
-    /// Every entry with a key `>= key`, in order. Descends along `key` and
-    /// seeds the stack with the subtrees that are entirely `>= key`.
+    /// Every entry with a key `>= key`, in order.
     #[must_use]
     pub fn lower_bound(&self, key: &[u8]) -> Iter<'_, V> {
-        let mut stack = Vec::new();
-        let mut node: &Node<V> = &self.root;
-        let mut acc: Vec<u8> = Vec::new();
-        let mut rest = key;
-        loop {
-            let n = node.prefix.len().min(rest.len());
-            match node.prefix[..n].cmp(&rest[..n]) {
-                // The whole subtree sorts below `key`.
-                Ordering::Less => break,
-                // The whole subtree sorts above `key`.
-                Ordering::Greater => {
-                    stack.push(Frame {
-                        node,
-                        len: acc.len(),
-                    });
-                    break;
-                }
-                Ordering::Equal => {}
-            }
-            if node.prefix.len() >= rest.len() {
-                // `key` runs out inside this node, so its whole subtree is >= key.
-                stack.push(Frame {
-                    node,
-                    len: acc.len(),
-                });
-                break;
-            }
-            // This node's own key is a strict prefix of `key`, so it sorts below
-            // `key` and is skipped, as are the children before `rest[0]`.
-            acc.extend_from_slice(&node.prefix);
-            rest = &rest[node.prefix.len()..];
-            for child in node.children.split(rest[0]).1.iter().rev().flatten() {
-                stack.push(Frame {
-                    node: child,
-                    len: acc.len(),
-                });
-            }
-            match node.children.get(rest[0]) {
-                Some(child) => node = child,
-                None => break,
-            }
-        }
-        Iter { path: acc, stack }
+        lower_bound(&self.root, key)
     }
 
     /// The same, plus the root watch: an entry can enter the range anywhere.
@@ -855,13 +867,7 @@ impl<V> Tree<V> {
     #[allow(clippy::iter_without_into_iter)] // `IntoIterator` for `&Tree` has no user yet.
     #[must_use]
     pub fn iter(&self) -> Iter<'_, V> {
-        Iter {
-            path: Vec::new(),
-            stack: vec![Frame {
-                node: &self.root,
-                len: 0,
-            }],
-        }
+        walk(&self.root)
     }
 
     #[must_use]
@@ -956,6 +962,25 @@ impl<V: 'static> Txn<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&Arc<V>> {
         descend(&self.root, key).0
+    }
+
+    /// Every entry, in ascending key order.
+    #[allow(clippy::iter_without_into_iter)] // `IntoIterator` for `&Txn` has no user yet.
+    #[must_use]
+    pub fn iter(&self) -> Iter<'_, V> {
+        walk(&self.root)
+    }
+
+    /// Every entry whose key starts with `p`.
+    #[must_use]
+    pub fn prefix(&self, p: &[u8]) -> Iter<'_, V> {
+        prefix_covering(&self.root, p).0
+    }
+
+    /// Every entry with a key `>= key`, in order.
+    #[must_use]
+    pub fn lower_bound(&self, key: &[u8]) -> Iter<'_, V> {
+        lower_bound(&self.root, key)
     }
 
     /// Returns the replaced value.

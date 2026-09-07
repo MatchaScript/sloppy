@@ -389,6 +389,108 @@ impl ReadTxn {
     }
 }
 
+/// What one table's reads run against: the root of a [`ReadTxn`], or, for a
+/// table a [`WriteTxn`] has touched, that transaction's own pending tree.
+///
+/// The trait hands back the results rather than the tree they came from, which
+/// keeps `tree::Node` and the two tree types out of its signature.
+trait Snapshot {
+    fn value<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<&Arc<Object<V>>>;
+
+    fn prefix<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        prefix: &[u8],
+    ) -> tree::Iter<'_, Object<V>>;
+
+    fn lower_bound<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> tree::Iter<'_, Object<V>>;
+
+    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Object<V>>;
+}
+
+impl Snapshot for ReadTxn {
+    fn value<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<&Arc<Object<V>>> {
+        table.entry(&self.0).primary.value(key)
+    }
+
+    fn prefix<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        prefix: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        table.entry(&self.0).primary.prefix(prefix)
+    }
+
+    fn lower_bound<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        table.entry(&self.0).primary.lower_bound(key)
+    }
+
+    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Object<V>> {
+        table.entry(&self.0).primary.iter()
+    }
+}
+
+/// A table this transaction has written reads from its pending tree, so the
+/// writes are there; every other table reads the root the transaction opened
+/// on. Reading opens no slot.
+impl Snapshot for WriteTxn<'_> {
+    fn value<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<&Arc<Object<V>>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.get(key),
+            None => table.entry(&self.root).primary.value(key),
+        }
+    }
+
+    fn prefix<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        prefix: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.prefix(prefix),
+            None => table.entry(&self.root).primary.prefix(prefix),
+        }
+    }
+
+    fn lower_bound<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.lower_bound(key),
+            None => table.entry(&self.root).primary.lower_bound(key),
+        }
+    }
+
+    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Object<V>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.iter(),
+            None => table.entry(&self.root).primary.iter(),
+        }
+    }
+}
+
 impl<V: Send + Sync + 'static> Table<V> {
     fn entry<'a>(&self, root: &'a Root) -> &'a TableEntry<V> {
         root.tables
@@ -413,12 +515,16 @@ impl<V: Send + Sync + 'static> Table<V> {
         self.entry(&txn.0).revision
     }
 
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
+    #[allow(private_bounds)]
     #[must_use]
-    pub fn get<'a>(&self, txn: &'a ReadTxn, key: &[u8]) -> Option<(&'a V, Revision)> {
-        let object = self.entry(&txn.0).primary.value(key)?;
+    pub fn get<'a>(&self, txn: &'a impl Snapshot, key: &[u8]) -> Option<(&'a V, Revision)> {
+        let object = txn.value(self, key)?;
         Some((object.value.as_ref(), object.revision))
     }
 
@@ -435,15 +541,19 @@ impl<V: Send + Sync + 'static> Table<V> {
         (obj.map(|o| (o.value.as_ref(), o.revision)), watch)
     }
 
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    pub fn prefix<'a>(
+    #[allow(private_bounds)]
+    pub fn prefix<'a, S: Snapshot>(
         &self,
-        txn: &'a ReadTxn,
+        txn: &'a S,
         prefix: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.entry(&txn.0).primary.prefix(prefix).map(row)
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+        txn.prefix(self, prefix).map(row)
     }
 
     /// # Panics
@@ -463,15 +573,19 @@ impl<V: Send + Sync + 'static> Table<V> {
 
     /// Every entry with a key `>= key`, in order.
     ///
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    pub fn lower_bound<'a>(
+    #[allow(private_bounds)]
+    pub fn lower_bound<'a, S: Snapshot>(
         &self,
-        txn: &'a ReadTxn,
+        txn: &'a S,
         key: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.entry(&txn.0).primary.lower_bound(key).map(row)
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+        txn.lower_bound(self, key).map(row)
     }
 
     /// The same, plus a watch that fires on any change to the table: an entry
@@ -540,14 +654,18 @@ impl<V: Send + Sync + 'static> Table<V> {
             .unwrap_or_else(|| panic!("table {} has no index {index}", self.name))
     }
 
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    pub fn all<'a>(
+    #[allow(private_bounds)]
+    pub fn all<'a, S: Snapshot>(
         &self,
-        txn: &'a ReadTxn,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.entry(&txn.0).primary.iter().map(row)
+        txn: &'a S,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+        txn.all(self).map(row)
     }
 
     /// Every entry, plus a watch that fires on any change to the table.
@@ -575,6 +693,22 @@ impl<V: Send + Sync + 'static> Table<V> {
     #[must_use]
     pub fn graveyard_len(&self, txn: &ReadTxn) -> usize {
         self.entry(&txn.0).graveyard.len()
+    }
+
+    /// The working copy of this table, if this transaction has opened one. A
+    /// handle from another `Db` reads no slot: it falls through to `entry`,
+    /// which is where the mismatch is reported.
+    fn opened<'t>(&self, txn: &'t WriteTxn<'_>) -> Option<&'t Pending<V>> {
+        let pending = txn
+            .pending
+            .get(self.pos)
+            .filter(|_| txn.root.db == self.db)?
+            .as_ref()?;
+        Some(
+            (&**pending as &dyn Any)
+                .downcast_ref()
+                .expect("pending table opened with another value type"),
+        )
     }
 
     /// The working copy of this table, opened on first use.
@@ -760,7 +894,6 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             primary_key: this.primary_key,
         })
     }
-
 }
 
 /// The write transaction. Dropping it aborts: nothing was ever visible.

@@ -71,6 +71,67 @@ fn snapshots_hold_their_version() {
     assert_eq!(items.lower_bound(&after, b"b").count(), 1);
 }
 
+/// The four plain reads through the open transaction see what it has written,
+/// at the revision its commit will carry, while everything else reads the root.
+#[test]
+fn a_write_txn_reads_its_own_writes() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let other = db.table("other", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    for key in ["a", "b", "d"] {
+        items.insert(&mut w, item(key, 1));
+    }
+    other.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    items.insert(&mut w, item("c", 2));
+    assert_eq!(items.delete(&mut w, b"a").unwrap().val, 1);
+    // Taken while the writer is open, after its writes.
+    let concurrent = db.read();
+
+    // What this transaction wrote is at the revision it will commit; what it
+    // left alone keeps the revision of the commit that wrote it.
+    assert_eq!(items.get(&w, b"b").map(|(v, r)| (v.val, r)), Some((2, 2)));
+    assert_eq!(items.get(&w, b"c").map(|(v, r)| (v.val, r)), Some((2, 2)));
+    assert_eq!(items.get(&w, b"d").map(|(v, r)| (v.val, r)), Some((1, 1)));
+    assert!(items.get(&w, b"a").is_none(), "deleted in this transaction");
+    assert_eq!(
+        items
+            .lower_bound(&w, b"a")
+            .map(|(k, v, r)| (k, v.val, r))
+            .collect::<Vec<_>>(),
+        vec![
+            (b"b".to_vec(), 2, 2),
+            (b"c".to_vec(), 2, 2),
+            (b"d".to_vec(), 1, 1),
+        ]
+    );
+    assert_eq!(items.prefix(&w, b"c").count(), 1);
+    assert_eq!(items.all(&w).count(), 3);
+
+    // A table this transaction never touched reads the root it opened on.
+    assert_eq!(other.get(&w, b"a").map(|(v, r)| (v.val, r)), Some((1, 1)));
+
+    // None of it is visible to a reader until the commit.
+    assert_eq!(concurrent.revision(), 1);
+    assert_eq!(items.get(&concurrent, b"a").map(|(v, _)| v.val), Some(1));
+    assert_eq!(items.get(&concurrent, b"b").map(|(v, _)| v.val), Some(1));
+    assert!(items.get(&concurrent, b"c").is_none());
+    assert_eq!(items.all(&concurrent).count(), 3);
+
+    assert_eq!(w.commit(), 2);
+    let after = db.read();
+    assert_eq!(items.all(&after).count(), 3);
+    assert_eq!(
+        items.get(&after, b"c").map(|(v, r)| (v.val, r)),
+        Some((2, 2))
+    );
+}
+
 #[test]
 fn abort_leaves_nothing() {
     let calls = Arc::new(Mutex::new(Vec::new()));
