@@ -58,7 +58,7 @@ impl Deref for Prefix {
 // picks it and growth and shrink need no code of their own.
 struct Node<V> {
     prefix: Prefix,
-    value: Option<Arc<V>>,
+    value: Option<V>,
     children: Children<V>,
     /// Closed by every commit that rebuilds this node, so it covers the whole
     /// subtree. It sits in the node, and goes with it.
@@ -73,7 +73,7 @@ struct Node<V> {
 
 impl<V> Node<V> {
     /// The value is new here, so its cell starts fresh.
-    fn new(prefix: &[u8], value: Option<Arc<V>>, children: Children<V>, txn: TxnId) -> Arc<Self> {
+    fn new(prefix: &[u8], value: Option<V>, children: Children<V>, txn: TxnId) -> Arc<Self> {
         Arc::new(Self {
             prefix: Prefix::new(prefix),
             value,
@@ -83,9 +83,15 @@ impl<V> Node<V> {
             txn,
         })
     }
+}
 
-    /// Path copy: the value comes over unchanged and keeps its cell, so a
-    /// `Watch` taken on the old node still tracks it.
+/// Mutation keeps a replaced node alive until the commit closes its cell, which
+/// is why these need `V` to outlive the transaction, and to be shareable: the
+/// cells wait in the `Db` until the root that owes them is published. A path
+/// copy clones the value, which is why they need `Clone`.
+impl<V: Clone + Send + Sync + 'static> Node<V> {
+    /// Path copy: the value is cloned and keeps its cell, so a `Watch` taken on
+    /// the old node still tracks it.
     fn copy(&self, txn: TxnId) -> Arc<Self> {
         Arc::new(Self {
             prefix: self.prefix.clone(),
@@ -96,12 +102,7 @@ impl<V> Node<V> {
             txn,
         })
     }
-}
 
-/// Mutation keeps a replaced node alive until the commit closes its cell, which
-/// is why these need `V` to outlive the transaction, and to be shareable: the
-/// cells wait in the `Db` until the root that owes them is published.
-impl<V: Send + Sync + 'static> Node<V> {
     /// The node this transaction may mutate: `*node` itself when this
     /// transaction built it, a path copy of it otherwise.
     ///
@@ -658,7 +659,7 @@ fn lcp(a: &[u8], b: &[u8]) -> usize {
 
 /// Returns the value at `key` and the deepest node the descent reached, which
 /// is where an insert of a missing `key` would attach.
-fn descend<'a, V>(root: &'a Arc<Node<V>>, key: &[u8]) -> (Option<&'a Arc<V>>, &'a Node<V>) {
+fn descend<'a, V>(root: &'a Arc<Node<V>>, key: &[u8]) -> (Option<&'a V>, &'a Node<V>) {
     let mut node: &Node<V> = root;
     let mut rest = key;
     loop {
@@ -821,7 +822,7 @@ impl<V> Tree<V> {
     /// The value at `key`, without watching anything: a reader that would drop
     /// the `Watch` should not make the cell allocate a channel.
     #[must_use]
-    pub fn value(&self, key: &[u8]) -> Option<&Arc<V>> {
+    pub fn value(&self, key: &[u8]) -> Option<&V> {
         descend(&self.root, key).0
     }
 
@@ -829,7 +830,7 @@ impl<V> Tree<V> {
     /// is absent, on the whole subtree of the deepest node the descent reached,
     /// which is where the key would appear.
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> (Option<&Arc<V>>, Watch) {
+    pub fn get(&self, key: &[u8]) -> (Option<&V>, Watch) {
         let (value, node) = descend(&self.root, key);
         let watch = if value.is_some() {
             node.value_cell.watch()
@@ -934,7 +935,7 @@ impl<V> Iter<'_, V> {
 }
 
 impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = &'a Arc<V>;
+    type Item = &'a V;
 
     // ponytail: no allocation per entry; the key stays in the walk's path
     // buffer, which `key` hands out a borrow of.
@@ -968,9 +969,9 @@ pub struct Txn<V> {
     w: Writing,
 }
 
-impl<V: Send + Sync + 'static> Txn<V> {
+impl<V: Clone + Send + Sync + 'static> Txn<V> {
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<&Arc<V>> {
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
         descend(&self.root, key).0
     }
 
@@ -994,15 +995,15 @@ impl<V: Send + Sync + 'static> Txn<V> {
     }
 
     /// Returns the replaced value.
-    pub fn insert(&mut self, key: &[u8], value: V) -> Option<Arc<V>> {
-        let old = insert(&mut self.root, key, Arc::new(value), &mut self.w);
+    pub fn insert(&mut self, key: &[u8], value: V) -> Option<V> {
+        let old = insert(&mut self.root, key, value, &mut self.w);
         if old.is_none() {
             self.len += 1;
         }
         old
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> Option<Arc<V>> {
+    pub fn delete(&mut self, key: &[u8]) -> Option<V> {
         // The descent below rebuilds as it goes, so the key is looked up first:
         // a miss must leave the tree alone.
         descend(&self.root, key).0?;
@@ -1037,12 +1038,12 @@ impl<V: Send + Sync + 'static> Txn<V> {
 ///
 /// A loop, not a recursion: the depth is the length of the longest chain of
 /// keys that are each a prefix of the next, which the keys' owner controls.
-fn insert<V: Send + Sync + 'static>(
+fn insert<V: Clone + Send + Sync + 'static>(
     mut node: &mut Arc<Node<V>>,
     mut key: &[u8],
-    value: Arc<V>,
+    value: V,
     w: &mut Writing,
-) -> Option<Arc<V>> {
+) -> Option<V> {
     loop {
         let common = lcp(&node.prefix, key);
 
@@ -1093,11 +1094,11 @@ fn insert<V: Send + Sync + 'static>(
 /// The way down owns every node on the path and takes each next node out of
 /// its parent's slot, so the way back up holds one node at a time: it puts the
 /// child back, drops it if it is gone, and shrinks the parent.
-fn delete<V: Send + Sync + 'static>(
+fn delete<V: Clone + Send + Sync + 'static>(
     root: &mut Arc<Node<V>>,
     key: &[u8],
     w: &mut Writing,
-) -> Arc<V> {
+) -> V {
     let mut node = std::mem::replace(root, Node::new(&[], None, Children::empty(), 0));
     let mut rest = key;
     let mut path: Vec<(Arc<Node<V>>, u8)> = Vec::new();
@@ -1137,7 +1138,7 @@ fn delete<V: Send + Sync + 'static>(
 /// that child. The root always stays, with an empty prefix.
 ///
 /// Returns whether the node is gone.
-fn shrink<V: Send + Sync + 'static>(
+fn shrink<V: Clone + Send + Sync + 'static>(
     node: &mut Arc<Node<V>>,
     is_root: bool,
     w: &mut Writing,
@@ -1177,7 +1178,7 @@ mod layout {
             24,
             "the inline prefix should fill the heap variant, no more"
         );
-        assert!(size_of::<Node<u64>>() <= 120, "the node grew a word");
+        assert!(size_of::<Node<u64>>() <= 128, "the node grew a word");
     }
 }
 
@@ -1194,7 +1195,7 @@ mod lookup {
         txn.insert(b"a", 1u64);
         let tree = txn.commit_and_notify();
 
-        assert_eq!(tree.value(b"a").map(|v| **v), Some(1));
+        assert_eq!(tree.value(b"a").copied(), Some(1));
         let node = descend(&tree.root, b"a").1;
         assert!(!node.value_cell.has_channel(), "`value` watches nothing");
 
