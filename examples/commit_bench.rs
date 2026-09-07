@@ -47,15 +47,16 @@ fn ns(elapsed: Duration, ops: u128) -> u128 {
     elapsed.as_nanos() / ops
 }
 
-/// Resident set in KiB, from the second field of `/proc/self/statm`.
+/// Resident set in KiB, from the `VmRSS` line of `/proc/self/status`, which
+/// the kernel already reports in KiB whatever the page size.
 fn rss_kb() -> u64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: u64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
-    pages * 4
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|kb| kb.parse().ok())
+        .unwrap_or(0)
 }
 
 fn main() {
