@@ -231,6 +231,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// reads take an `Arc` of the current root and release the lock at once.
 pub struct Db {
     root: RwLock<Arc<Root>>,
+    /// The newest prepared root, which [`Db::write`] opens on. Equal to `root`
+    /// while nothing prepared is unpublished.
+    head: Mutex<Arc<Root>>,
     write: Mutex<()>,
     hook: Mutex<Hook>,
 }
@@ -255,13 +258,15 @@ impl Db {
     /// of `commit`.
     pub fn with_hook(hook: impl FnMut(Revision, &ReadTxn) + Send + 'static) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let root = Arc::new(Root {
+            db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            revision: 0,
+            compacted: 0,
+            tables: Vec::new(),
+        });
         Self {
-            root: RwLock::new(Arc::new(Root {
-                db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                revision: 0,
-                compacted: 0,
-                tables: Vec::new(),
-            })),
+            root: RwLock::new(root.clone()),
+            head: Mutex::new(root),
             write: Mutex::new(()),
             hook: Mutex::new(Box::new(hook)),
         }
@@ -274,11 +279,21 @@ impl Db {
             .clone()
     }
 
+    /// The one place the visible root is replaced. `head` follows unless a
+    /// prepare has already moved it past the root being replaced, so a `table`
+    /// or `compact` between transactions is on the next `write`, and a publish
+    /// leaves the newer prepared root in place.
     fn install(&self, root: Arc<Root>) {
         let old = {
             let mut current = self.root.write().unwrap_or_else(PoisonError::into_inner);
-            std::mem::replace(&mut *current, root)
+            std::mem::replace(&mut *current, root.clone())
         };
+        {
+            let mut head = lock(&self.head);
+            if Arc::ptr_eq(&head, &old) {
+                *head = root;
+            }
+        }
         // A value's destructor may read this Db, so the old root must outlive
         // the root write guard.
         drop(old);
@@ -322,12 +337,12 @@ impl Db {
         ReadTxn(self.snapshot())
     }
 
-    /// Opens the write transaction. Blocks until the previous one commits or is
-    /// dropped.
+    /// Opens the write transaction on the newest prepared root. Blocks until
+    /// the previous one commits or is dropped.
     #[must_use]
     pub fn write(&self) -> WriteTxn<'_> {
         let guard = lock(&self.write);
-        let root = (*self.snapshot()).clone();
+        let root = lock(&self.head).clone();
         let pending = std::iter::repeat_with(|| None)
             .take(root.tables.len())
             .collect();
@@ -355,6 +370,44 @@ impl Db {
             }
         }
         self.install(Arc::new(root));
+    }
+
+    /// Makes a prepared root visible and returns its revision.
+    ///
+    /// # Panics
+    ///
+    /// If `p` is not prepared on the visible root, which is what publishing out
+    /// of the order the roots were prepared in looks like. Also propagates a
+    /// panic from the commit hook.
+    pub fn publish(&self, p: Prepared) -> Revision {
+        let Prepared {
+            parent,
+            root,
+            closed,
+            dirty,
+        } = p;
+        assert!(
+            Arc::ptr_eq(&self.snapshot(), &parent),
+            "published a root prepared on an older one"
+        );
+        let revision = root.revision;
+        self.install(root.clone());
+        closed.close();
+        if dirty {
+            let txn = ReadTxn(root);
+            lock(&self.hook)(revision, &txn);
+        }
+        revision
+    }
+
+    /// Drops a prepared root and puts `head` back on the one it was built on.
+    /// Nothing ever saw it, so none of its cells are closed.
+    ///
+    /// The writer lock is not reentrant: an open [`WriteTxn`] must be dropped
+    /// first.
+    pub fn abandon(&self, p: Prepared) {
+        let _guard = lock(&self.write);
+        *lock(&self.head) = p.parent;
     }
 }
 
@@ -389,6 +442,108 @@ impl ReadTxn {
     }
 }
 
+/// What one table's reads run against: the root of a [`ReadTxn`], or, for a
+/// table a [`WriteTxn`] has touched, that transaction's own pending tree.
+///
+/// The trait hands back the results rather than the tree they came from, which
+/// keeps `tree::Node` and the two tree types out of its signature.
+trait Snapshot {
+    fn value<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<&Arc<Object<V>>>;
+
+    fn prefix<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        prefix: &[u8],
+    ) -> tree::Iter<'_, Object<V>>;
+
+    fn lower_bound<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> tree::Iter<'_, Object<V>>;
+
+    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Object<V>>;
+}
+
+impl Snapshot for ReadTxn {
+    fn value<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<&Arc<Object<V>>> {
+        table.entry(&self.0).primary.value(key)
+    }
+
+    fn prefix<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        prefix: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        table.entry(&self.0).primary.prefix(prefix)
+    }
+
+    fn lower_bound<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        table.entry(&self.0).primary.lower_bound(key)
+    }
+
+    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Object<V>> {
+        table.entry(&self.0).primary.iter()
+    }
+}
+
+/// A table this transaction has written reads from its pending tree, so the
+/// writes are there; every other table reads the root the transaction opened
+/// on. Reading opens no slot.
+impl Snapshot for WriteTxn<'_> {
+    fn value<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<&Arc<Object<V>>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.get(key),
+            None => table.entry(&self.root).primary.value(key),
+        }
+    }
+
+    fn prefix<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        prefix: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.prefix(prefix),
+            None => table.entry(&self.root).primary.prefix(prefix),
+        }
+    }
+
+    fn lower_bound<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> tree::Iter<'_, Object<V>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.lower_bound(key),
+            None => table.entry(&self.root).primary.lower_bound(key),
+        }
+    }
+
+    fn all<V: Send + Sync + 'static>(&self, table: &Table<V>) -> tree::Iter<'_, Object<V>> {
+        match table.opened(self) {
+            Some(pending) => pending.primary.iter(),
+            None => table.entry(&self.root).primary.iter(),
+        }
+    }
+}
+
 impl<V: Send + Sync + 'static> Table<V> {
     fn entry<'a>(&self, root: &'a Root) -> &'a TableEntry<V> {
         root.tables
@@ -413,12 +568,16 @@ impl<V: Send + Sync + 'static> Table<V> {
         self.entry(&txn.0).revision
     }
 
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
+    #[allow(private_bounds)]
     #[must_use]
-    pub fn get<'a>(&self, txn: &'a ReadTxn, key: &[u8]) -> Option<(&'a V, Revision)> {
-        let object = self.entry(&txn.0).primary.value(key)?;
+    pub fn get<'a>(&self, txn: &'a impl Snapshot, key: &[u8]) -> Option<(&'a V, Revision)> {
+        let object = txn.value(self, key)?;
         Some((object.value.as_ref(), object.revision))
     }
 
@@ -435,15 +594,19 @@ impl<V: Send + Sync + 'static> Table<V> {
         (obj.map(|o| (o.value.as_ref(), o.revision)), watch)
     }
 
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    pub fn prefix<'a>(
+    #[allow(private_bounds)]
+    pub fn prefix<'a, S: Snapshot>(
         &self,
-        txn: &'a ReadTxn,
+        txn: &'a S,
         prefix: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.entry(&txn.0).primary.prefix(prefix).map(row)
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+        txn.prefix(self, prefix).map(row)
     }
 
     /// # Panics
@@ -463,15 +626,19 @@ impl<V: Send + Sync + 'static> Table<V> {
 
     /// Every entry with a key `>= key`, in order.
     ///
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    pub fn lower_bound<'a>(
+    #[allow(private_bounds)]
+    pub fn lower_bound<'a, S: Snapshot>(
         &self,
-        txn: &'a ReadTxn,
+        txn: &'a S,
         key: &[u8],
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.entry(&txn.0).primary.lower_bound(key).map(row)
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+        txn.lower_bound(self, key).map(row)
     }
 
     /// The same, plus a watch that fires on any change to the table: an entry
@@ -540,14 +707,18 @@ impl<V: Send + Sync + 'static> Table<V> {
             .unwrap_or_else(|| panic!("table {} has no index {index}", self.name))
     }
 
+    /// `txn` is a [`ReadTxn`], or a [`WriteTxn`], which also sees its own
+    /// writes.
+    ///
     /// # Panics
     ///
     /// If the table was not registered in this `Db`.
-    pub fn all<'a>(
+    #[allow(private_bounds)]
+    pub fn all<'a, S: Snapshot>(
         &self,
-        txn: &'a ReadTxn,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V> {
-        self.entry(&txn.0).primary.iter().map(row)
+        txn: &'a S,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, Revision)> + use<'a, V, S> {
+        txn.all(self).map(row)
     }
 
     /// Every entry, plus a watch that fires on any change to the table.
@@ -575,6 +746,22 @@ impl<V: Send + Sync + 'static> Table<V> {
     #[must_use]
     pub fn graveyard_len(&self, txn: &ReadTxn) -> usize {
         self.entry(&txn.0).graveyard.len()
+    }
+
+    /// The working copy of this table, if this transaction has opened one. A
+    /// handle from another `Db` reads no slot: it falls through to `entry`,
+    /// which is where the mismatch is reported.
+    fn opened<'t>(&self, txn: &'t WriteTxn<'_>) -> Option<&'t Pending<V>> {
+        let pending = txn
+            .pending
+            .get(self.pos)
+            .filter(|_| txn.root.db == self.db)?
+            .as_ref()?;
+        Some(
+            (&**pending as &dyn Any)
+                .downcast_ref()
+                .expect("pending table opened with another value type"),
+        )
     }
 
     /// The working copy of this table, opened on first use.
@@ -760,37 +947,52 @@ impl<V: Send + Sync + 'static> AnyPending for Pending<V> {
             primary_key: this.primary_key,
         })
     }
-
 }
 
 /// The write transaction. Dropping it aborts: nothing was ever visible.
 pub struct WriteTxn<'a> {
     db: &'a Db,
     _guard: MutexGuard<'a, ()>,
-    root: Root,
+    /// The root this transaction opened on; `prepare` clones it to build the
+    /// new one.
+    root: Arc<Root>,
     /// One slot per table, `Some` once the table is touched.
     pending: Vec<Option<Box<dyn AnyPending>>>,
     dirty: bool,
 }
 
+/// A root this transaction settled but no reader has seen. Stays on the thread
+/// that prepared it: `Closed` holds cells that are neither `Send` nor `Sync`.
+pub struct Prepared {
+    /// The root this one was built on, which [`Db::publish`] checks is still
+    /// the visible one.
+    parent: Arc<Root>,
+    root: Arc<Root>,
+    closed: Closed,
+    dirty: bool,
+}
+
 impl WriteTxn<'_> {
-    /// Installs the new root and returns its revision, which is the previous
-    /// one if nothing was written.
-    ///
-    /// # Panics
-    ///
-    /// Propagates a panic from the commit hook.
-    pub fn commit(self) -> Revision {
+    /// Settles the trees, moves `head` onto the new root and releases the
+    /// writer lock. Nothing is visible until [`Db::publish`].
+    #[must_use]
+    pub fn prepare(self) -> Prepared {
         let WriteTxn {
             db,
             _guard: guard,
-            mut root,
+            root: parent,
             pending,
             dirty,
         } = self;
         if pending.iter().all(Option::is_none) {
-            return root.revision;
+            return Prepared {
+                root: parent.clone(),
+                parent,
+                closed: Closed::default(),
+                dirty: false,
+            };
         }
+        let mut root = (*parent).clone();
         let revision = root.revision + Revision::from(dirty);
         let mut closed = Closed::default();
         for (pos, table) in pending.into_iter().enumerate() {
@@ -808,15 +1010,29 @@ impl WriteTxn<'_> {
         }
         root.revision = revision;
 
-        let snapshot = Arc::new(root);
-        db.install(snapshot.clone());
-        closed.close();
-        if dirty {
-            let txn = ReadTxn(snapshot);
-            lock(&db.hook)(revision, &txn);
-        }
+        let root = Arc::new(root);
+        *lock(&db.head) = root.clone();
         drop(guard);
-        revision
+        Prepared {
+            parent,
+            root,
+            closed,
+            dirty,
+        }
+    }
+
+    /// Installs the new root and returns its revision, which is the previous
+    /// one if nothing was written.
+    ///
+    /// # Panics
+    ///
+    /// If a prepared root is still unpublished: this transaction opened on it,
+    /// not on the visible root. Also propagates a panic from the commit hook.
+    // The revision is worth ignoring; the commit itself is the point.
+    #[allow(clippy::must_use_candidate)]
+    pub fn commit(self) -> Revision {
+        let db = self.db;
+        db.publish(self.prepare())
     }
 }
 

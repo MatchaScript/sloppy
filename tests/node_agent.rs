@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sloppy::db::{Change, Db, Index, Key};
+use sloppy::db::{Change, Db, Index, Key, Prepared};
 
 const KEYS: u64 = 200;
 const COMMITS: usize = 2_000;
@@ -99,10 +99,23 @@ fn a_read_does_not_wait_for_an_open_write_transaction() {
 }
 
 #[test]
+fn readers_keep_up_with_a_busy_writer() {
+    readers_keep_up(false);
+}
+
+/// The same run with the writer pipelined: it opens each transaction on the
+/// root the one before it prepared, and publishes that one only after this
+/// one is prepared, as a writer that waits for durability between the two
+/// would.
+#[test]
+fn readers_keep_up_with_a_pipelined_writer() {
+    readers_keep_up(true);
+}
+
 // One acceptance run: splitting the four threads apart would only move the
 // shared setup into arguments.
 #[allow(clippy::too_many_lines)]
-fn readers_keep_up_with_a_busy_writer() {
+fn readers_keep_up(pipelined: bool) {
     let db = Arc::new(Db::new());
     let table = db.table("recs", rec_key as fn(&Rec) -> Key, &[BY_TENANT]);
     // The revision of the writer's last commit, announced just before it is
@@ -118,6 +131,7 @@ fn readers_keep_up_with_a_busy_writer() {
         let (db, finish) = (db.clone(), finish.clone());
         thread::spawn(move || {
             let mut rng = Lcg(0x2026_0904);
+            let mut flight: Option<Prepared> = None;
             let start = Instant::now();
             for round in 0..COMMITS {
                 let mut w = db.write();
@@ -131,7 +145,19 @@ fn readers_keep_up_with_a_busy_writer() {
                         table.insert(&mut w, Rec { key, tenant, n });
                     }
                 }
-                w.commit();
+                if pipelined {
+                    // Prepare this round on top of the one in flight, then
+                    // publish that one. `head` stays on this round's root.
+                    let next = w.prepare();
+                    if let Some(prev) = flight.replace(next) {
+                        db.publish(prev);
+                    }
+                } else {
+                    w.commit();
+                }
+            }
+            if let Some(prev) = flight.take() {
+                db.publish(prev);
             }
             let last = db.read().revision() + 1;
             finish.store(last, Ordering::SeqCst);

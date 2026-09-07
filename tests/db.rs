@@ -71,6 +71,67 @@ fn snapshots_hold_their_version() {
     assert_eq!(items.lower_bound(&after, b"b").count(), 1);
 }
 
+/// The four plain reads through the open transaction see what it has written,
+/// at the revision its commit will carry, while everything else reads the root.
+#[test]
+fn a_write_txn_reads_its_own_writes() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    let other = db.table("other", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    for key in ["a", "b", "d"] {
+        items.insert(&mut w, item(key, 1));
+    }
+    other.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    items.insert(&mut w, item("c", 2));
+    assert_eq!(items.delete(&mut w, b"a").unwrap().val, 1);
+    // Taken while the writer is open, after its writes.
+    let concurrent = db.read();
+
+    // What this transaction wrote is at the revision it will commit; what it
+    // left alone keeps the revision of the commit that wrote it.
+    assert_eq!(items.get(&w, b"b").map(|(v, r)| (v.val, r)), Some((2, 2)));
+    assert_eq!(items.get(&w, b"c").map(|(v, r)| (v.val, r)), Some((2, 2)));
+    assert_eq!(items.get(&w, b"d").map(|(v, r)| (v.val, r)), Some((1, 1)));
+    assert!(items.get(&w, b"a").is_none(), "deleted in this transaction");
+    assert_eq!(
+        items
+            .lower_bound(&w, b"a")
+            .map(|(k, v, r)| (k, v.val, r))
+            .collect::<Vec<_>>(),
+        vec![
+            (b"b".to_vec(), 2, 2),
+            (b"c".to_vec(), 2, 2),
+            (b"d".to_vec(), 1, 1),
+        ]
+    );
+    assert_eq!(items.prefix(&w, b"c").count(), 1);
+    assert_eq!(items.all(&w).count(), 3);
+
+    // A table this transaction never touched reads the root it opened on.
+    assert_eq!(other.get(&w, b"a").map(|(v, r)| (v.val, r)), Some((1, 1)));
+
+    // None of it is visible to a reader until the commit.
+    assert_eq!(concurrent.revision(), 1);
+    assert_eq!(items.get(&concurrent, b"a").map(|(v, _)| v.val), Some(1));
+    assert_eq!(items.get(&concurrent, b"b").map(|(v, _)| v.val), Some(1));
+    assert!(items.get(&concurrent, b"c").is_none());
+    assert_eq!(items.all(&concurrent).count(), 3);
+
+    assert_eq!(w.commit(), 2);
+    let after = db.read();
+    assert_eq!(items.all(&after).count(), 3);
+    assert_eq!(
+        items.get(&after, b"c").map(|(v, r)| (v.val, r)),
+        Some((2, 2))
+    );
+}
+
 #[test]
 fn abort_leaves_nothing() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -786,4 +847,289 @@ fn table_handle_rejects_another_db_after_its_slot_was_opened() {
     let mut w = b.write();
     tb.insert(&mut w, item("local", 1));
     ta.insert(&mut w, item("foreign", 2));
+}
+
+// -------------------------------------------------------- prepare and publish
+
+#[test]
+fn a_prepared_root_is_invisible_until_publish() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    let prepared = w.prepare();
+
+    let r = db.read();
+    assert_eq!(r.revision(), 1);
+    assert!(items.get(&r, b"b").is_none());
+    assert_eq!(items.all(&r).count(), 1);
+
+    assert_eq!(db.publish(prepared), 2);
+    let r = db.read();
+    assert_eq!(r.revision(), 2);
+    assert_eq!(
+        items.get(&r, b"b").map(|(v, rev)| (v.val, rev)),
+        Some((2, 2))
+    );
+}
+
+/// A transaction opened while a prepared root is outstanding builds on it, so
+/// its own reads see the prepared content and its writes carry on the chain.
+#[test]
+fn a_write_after_prepare_reads_the_prepared_root() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    let first = w.prepare();
+
+    let mut w = db.write();
+    assert_eq!(
+        items.get(&w, b"b").map(|(v, rev)| (v.val, rev)),
+        Some((2, 2))
+    );
+    assert_eq!(items.all(&w).count(), 2);
+    items.insert(&mut w, item("c", 3));
+    assert_eq!(
+        items.get(&w, b"c").map(|(v, rev)| (v.val, rev)),
+        Some((3, 3))
+    );
+    let second = w.prepare();
+
+    assert_eq!(db.publish(first), 2);
+    assert_eq!(db.publish(second), 3);
+    assert_eq!(items.all(&db.read()).count(), 3);
+}
+
+#[test]
+fn two_prepared_roots_publish_one_revision_each() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    let first = w.prepare();
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    let second = w.prepare();
+
+    assert_eq!(db.publish(first), 1);
+    assert_eq!(db.read().revision(), 1);
+    assert_eq!(db.publish(second), 2);
+    assert_eq!(db.read().revision(), 2);
+
+    let r = db.read();
+    assert_eq!(items.get(&r, b"a").unwrap().1, 1);
+    assert_eq!(items.get(&r, b"b").unwrap().1, 2);
+}
+
+/// Publishing the older of two prepared roots leaves `head` on the newer one,
+/// so the next transaction carries the chain on rather than forking it.
+#[test]
+fn publishing_the_older_root_keeps_head_on_the_newer() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    let first = w.prepare();
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    let second = w.prepare();
+    assert_eq!(db.publish(first), 1);
+
+    let mut w = db.write();
+    assert_eq!(items.get(&w, b"b").unwrap().1, 2);
+    items.insert(&mut w, item("c", 3));
+    let third = w.prepare();
+    assert_eq!(db.publish(second), 2);
+    assert_eq!(db.publish(third), 3);
+    assert_eq!(items.all(&db.read()).count(), 3);
+}
+
+#[test]
+#[should_panic(expected = "prepared on an older one")]
+fn publishing_out_of_order_panics() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    let _first = w.prepare();
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    let second = w.prepare();
+
+    db.publish(second);
+}
+
+/// `commit` is `prepare` then `publish`, and the transaction opened on the
+/// prepared root, so the parent check is what reports the misuse.
+#[test]
+#[should_panic(expected = "prepared on an older one")]
+fn a_commit_with_a_prepared_root_outstanding_panics() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    let _prepared = w.prepare();
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    w.commit();
+}
+
+#[test]
+fn a_write_after_abandon_opens_on_the_visible_root() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    db.abandon(w.prepare());
+
+    let mut w = db.write();
+    assert!(items.get(&w, b"b").is_none(), "the abandoned root is gone");
+    items.insert(&mut w, item("c", 3));
+    assert_eq!(w.commit(), 2);
+
+    let r = db.read();
+    assert_eq!(items.all(&r).count(), 2);
+    assert_eq!(items.get(&r, b"c").unwrap().1, 2);
+}
+
+/// `table` and `compact` replace the visible root between transactions, and the
+/// next `write` has to open on what they left, not on the root before them.
+#[test]
+fn table_and_compact_carry_the_head_along() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let late = db.table("late", pk as fn(&Item) -> Key, &[]);
+    let mut w = db.write();
+    late.insert(&mut w, item("x", 1));
+    assert_eq!(w.commit(), 2);
+    assert_eq!(late.get(&db.read(), b"x").unwrap().0.val, 1);
+
+    let mut slow = observe(&db, items);
+    let mut w = db.write();
+    items.delete(&mut w, b"a");
+    assert_eq!(w.commit(), 3);
+    assert_eq!(items.graveyard_len(&db.read()), 1);
+
+    db.compact(3);
+    assert_eq!(items.graveyard_len(&db.read()), 0);
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 1));
+    assert_eq!(w.commit(), 4);
+    // The tombstone would be back if this commit had built on the root from
+    // before the compaction.
+    assert_eq!(items.graveyard_len(&db.read()), 0);
+    assert_eq!(slow.next(&db.read()).err().map(|e| e.at), Some(3));
+}
+
+/// Registering costs no revision but still installs a root, which is what
+/// carries the new tracker.
+#[test]
+fn a_registration_only_transaction_publishes_its_root() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let mut w = db.write();
+    let mut reader = items.changes(&mut w);
+    let prepared = w.prepare();
+    assert_eq!(db.publish(prepared), 1);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("b", 2));
+    assert_eq!(w.commit(), 2);
+
+    assert_eq!(
+        drain(reader.next(&db.read()).unwrap().0),
+        vec![("b".into(), 2, false)]
+    );
+}
+
+#[test]
+fn the_hook_runs_on_publish_not_prepare() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    let db = Db::with_hook(move |rev: Revision, _: &ReadTxn| seen.lock().unwrap().push(rev));
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    let prepared = w.prepare();
+    assert!(calls.lock().unwrap().is_empty());
+
+    assert_eq!(db.publish(prepared), 1);
+    assert_eq!(*calls.lock().unwrap(), vec![1]);
+}
+
+#[tokio::test]
+async fn a_watch_completes_on_publish_not_prepare() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let (_, mut watch) = items.get_watch(&db.read(), b"a");
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 2));
+    let prepared = w.prepare();
+    assert!(!watch.is_closed(), "the prepared root is not visible yet");
+
+    assert_eq!(db.publish(prepared), 2);
+    assert!(watch.is_closed());
+    watch.changed().await;
+}
+
+/// The cell the prepared root owes is closed at publish, not dropped at
+/// prepare, so a reader that subscribes in between gets an open watch.
+#[tokio::test]
+async fn a_watch_taken_between_prepare_and_publish_completes_on_publish() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 1));
+    assert_eq!(w.commit(), 1);
+
+    let visible = db.read();
+    let mut w = db.write();
+    items.insert(&mut w, item("a", 2));
+    let prepared = w.prepare();
+
+    let (value, mut late) = items.get_watch(&visible, b"a");
+    assert_eq!(value.unwrap().0.val, 1, "the visible root still reads 1");
+    assert!(!late.is_closed());
+
+    assert_eq!(db.publish(prepared), 2);
+    assert!(late.is_closed());
+    late.changed().await;
 }

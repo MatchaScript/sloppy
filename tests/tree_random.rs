@@ -1,6 +1,7 @@
 //! The tree against a `BTreeMap` over a fixed-seed random operation stream.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use sloppy::tree::Tree;
 
@@ -29,8 +30,12 @@ impl Lcg {
     }
 }
 
+fn walked<'a>(it: impl Iterator<Item = (Vec<u8>, &'a Arc<u64>)>) -> Vec<(Vec<u8>, u64)> {
+    it.map(|(k, v)| (k, **v)).collect()
+}
+
 fn entries(tree: &Tree<u64>) -> Vec<(Vec<u8>, u64)> {
-    tree.iter().map(|(k, v)| (k, **v)).collect()
+    walked(tree.iter())
 }
 
 fn model_entries<'a>(it: impl Iterator<Item = (&'a Vec<u8>, &'a u64)>) -> Vec<(Vec<u8>, u64)> {
@@ -49,8 +54,10 @@ fn matches_btreemap() {
     while ops < 20_000 {
         let batch = 1 + rng.below(16);
         let mut txn = tree.txn();
+        let mut touched: Vec<Vec<u8>> = Vec::new();
         for _ in 0..batch {
             let key = rng.key();
+            touched.push(key.clone());
             if rng.below(3) == 0 {
                 let gone = txn.delete(&key).map(|v| *v);
                 assert_eq!(gone, model.remove(&key), "delete {key:?}");
@@ -67,6 +74,34 @@ fn matches_btreemap() {
             assert_eq!(txn.get(&key).map(|v| **v), model.get(&key).copied());
             ops += 1;
         }
+
+        // The same reads on the open txn, which the model already agrees with,
+        // before anything is committed.
+        assert_eq!(walked(txn.iter()), model_entries(model.iter()));
+        for _ in 0..2 {
+            let p = rng.key();
+            let want = model_entries(model.iter().filter(|(k, _)| k.starts_with(&p)));
+            assert_eq!(walked(txn.prefix(&p)), want, "txn prefix {p:?}");
+        }
+        for _ in 0..2 {
+            let key = rng.key();
+            let want = model_entries(model.range(key.clone()..));
+            assert_eq!(
+                walked(txn.lower_bound(&key)),
+                want,
+                "txn lower_bound {key:?}"
+            );
+            // A key this batch left alone reads the same on the snapshot the
+            // txn was opened on.
+            if !touched.contains(&key) {
+                assert_eq!(
+                    txn.get(&key).map(|v| **v),
+                    tree.value(&key).map(|v| **v),
+                    "untouched {key:?}"
+                );
+            }
+        }
+
         tree = txn.commit_and_notify();
 
         tree.assert_invariants();
