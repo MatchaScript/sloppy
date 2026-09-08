@@ -26,7 +26,7 @@ use crate::tree::Tree;
 use crate::watch::{Covered, Watch};
 
 use stream::{revision_of, stream_key, table_of};
-use table::{AnyTable, Op, State, TableEntry};
+use table::{AnyTable, Pending, State, TableEntry};
 
 pub use row::Version;
 pub use stream::{Change, ChangeIterator, Compacted};
@@ -35,13 +35,6 @@ pub use write::WriteTxn;
 
 pub type Revision = u64;
 pub type Key = Box<[u8]>;
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    // A panic under the writer lock leaves the trees as the write it was in the
-    // middle of left them, and the revision unpublished, so a poisoned lock
-    // guards nothing a later writer cannot write over.
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// What a [`Watch`], a [`ReadTxn`] and the writer all reach the data through.
 ///
@@ -56,6 +49,8 @@ struct Shared {
     revision: AtomicU64,
     /// History at or below this revision is gone; see [`Db::compact`].
     compacted: AtomicU64,
+    /// The revision a commit panicked partway through, or 0. See [`Db::lock`].
+    wedged: AtomicU64,
     /// Registered tables, in registration order. Only [`Db::table`] writes it,
     /// and only by appending, so a handle keeps its position for good.
     tables: RwLock<Vec<Arc<dyn AnyTable>>>,
@@ -157,6 +152,7 @@ impl Db {
                 db: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 revision: AtomicU64::new(0),
                 compacted: AtomicU64::new(0),
+                wedged: AtomicU64::new(0),
                 tables: RwLock::new(Vec::new()),
                 changes: Tree::new(),
                 revisions: receiver,
@@ -168,6 +164,27 @@ impl Db {
 
     fn revision(&self) -> Revision {
         self.shared.revision.load(Ordering::Acquire)
+    }
+
+    /// Takes the writer lock, on a database that can still be written to.
+    ///
+    /// A commit that panicked partway through left the writes it had applied
+    /// in the trees, under a revision it never published. There is no undo:
+    /// the next commit would take that revision and publish those writes along
+    /// with its own, so it is refused, and so is every writer after it. A read
+    /// runs on, at the last revision a commit did publish.
+    ///
+    /// # Panics
+    ///
+    /// If a commit panicked partway through.
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        let guard = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let wedged = self.shared.wedged.load(Ordering::Acquire);
+        assert_eq!(
+            wedged, 0,
+            "a commit panicked partway through revision {wedged}, which it never published"
+        );
+        guard
     }
 
     /// Completes on the next commit that bumps the revision. A reader that
@@ -188,7 +205,7 @@ impl Db {
         primary_key: fn(&V) -> Key,
         indexes: &[Index<V>],
     ) -> Table<V> {
-        let _guard = lock(&self.write);
+        let _guard = self.lock();
         for (at, index) in indexes.iter().enumerate() {
             assert!(
                 indexes[..at].iter().all(|other| other.name != index.name),
@@ -239,7 +256,7 @@ impl Db {
     }
 
     fn open(&self, at: Option<Revision>) -> WriteTxn<'_> {
-        let guard = lock(&self.write);
+        let guard = self.lock();
         let visible = self.revision();
         let revision = at.unwrap_or(visible + 1);
         assert!(
@@ -268,7 +285,7 @@ impl Db {
     ///
     /// This is not history: it does not bump the revision.
     pub fn compact(&self, rev: Revision) {
-        let _guard = lock(&self.write);
+        let _guard = self.lock();
         let compacted = rev.max(self.shared.compacted.load(Ordering::Acquire));
         self.shared.compacted.store(compacted, Ordering::Release);
         let tables = self
@@ -331,16 +348,17 @@ trait Snapshot {
     /// The revision the trees are read at.
     fn at(&self) -> Revision;
 
-    /// The revision a buffered write carries; the same as `at` for a reader.
-    fn revision(&self) -> Revision;
-
     fn shared(&self) -> &Arc<Shared>;
 
     /// The write this transaction has buffered for `key`, if any.
-    fn buffered<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<Op<V>>;
+    fn buffered<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<Pending<V>>;
 
     /// Everything it has buffered for one table, in key order.
-    fn buffer<V: Send + Sync + 'static>(&self, table: &Table<V>) -> Vec<(Key, Op<V>)>;
+    fn buffer<V: Send + Sync + 'static>(&self, table: &Table<V>) -> Vec<Pending<V>>;
 }
 
 impl Snapshot for ReadTxn {
@@ -348,19 +366,15 @@ impl Snapshot for ReadTxn {
         self.revision
     }
 
-    fn revision(&self) -> Revision {
-        self.revision
-    }
-
     fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
 
-    fn buffered<V: Send + Sync + 'static>(&self, _: &Table<V>, _: &[u8]) -> Option<Op<V>> {
+    fn buffered<V: Send + Sync + 'static>(&self, _: &Table<V>, _: &[u8]) -> Option<Pending<V>> {
         None
     }
 
-    fn buffer<V: Send + Sync + 'static>(&self, _: &Table<V>) -> Vec<(Key, Op<V>)> {
+    fn buffer<V: Send + Sync + 'static>(&self, _: &Table<V>) -> Vec<Pending<V>> {
         Vec::new()
     }
 }
@@ -372,27 +386,23 @@ impl Snapshot for WriteTxn<'_> {
         self.visible
     }
 
-    fn revision(&self) -> Revision {
-        self.revision
-    }
-
     fn shared(&self) -> &Arc<Shared> {
         &self.db.shared
     }
 
-    fn buffered<V: Send + Sync + 'static>(&self, table: &Table<V>, key: &[u8]) -> Option<Op<V>> {
+    fn buffered<V: Send + Sync + 'static>(
+        &self,
+        table: &Table<V>,
+        key: &[u8],
+    ) -> Option<Pending<V>> {
         table.opened(self)?.written(key).cloned()
     }
 
-    fn buffer<V: Send + Sync + 'static>(&self, table: &Table<V>) -> Vec<(Key, Op<V>)> {
-        let mut buffered: Vec<(Key, Op<V>)> = table.opened(self).map_or_else(Vec::new, |buffer| {
-            buffer
-                .pending
-                .iter()
-                .map(|write| (write.key.clone(), write.op.clone()))
-                .collect()
-        });
-        buffered.sort_by(|(a, _), (b, _)| a.cmp(b));
+    fn buffer<V: Send + Sync + 'static>(&self, table: &Table<V>) -> Vec<Pending<V>> {
+        let mut buffered: Vec<Pending<V>> = table
+            .opened(self)
+            .map_or_else(Vec::new, |buffer| buffer.pending.clone());
+        buffered.sort_by(|a, b| a.key.cmp(&b.key));
         buffered
     }
 }

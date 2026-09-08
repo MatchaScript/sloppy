@@ -1,9 +1,20 @@
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::table::{AnyBuffer, Applying};
 use super::{Db, Revision};
+
+/// Armed while a commit is writing to the trees: if it does not get to the end,
+/// it unwinds through this and the database takes no further writes. See
+/// [`Db::lock`].
+struct Wedge<'a>(&'a AtomicU64, Revision);
+
+impl Drop for Wedge<'_> {
+    fn drop(&mut self) {
+        self.0.store(self.1, Ordering::Release);
+    }
+}
 
 /// The write transaction. Dropping it aborts: the buffer goes and no tree was
 /// ever touched.
@@ -46,6 +57,7 @@ impl WriteTxn<'_> {
             return visible;
         }
         let shared = &db.shared;
+        let wedge = Wedge(&shared.wedged, revision);
         {
             let tables = shared.tables.read().unwrap_or_else(PoisonError::into_inner);
             let mut at = Applying {
@@ -62,6 +74,8 @@ impl WriteTxn<'_> {
                 }
             }
         }
+        // The trees hold the whole commit, so the wedge goes unfired.
+        std::mem::forget(wedge);
         // The revision comes last: a reader that has it has everything this
         // commit wrote, and one that read the revision before it passes over
         // every version this commit left.

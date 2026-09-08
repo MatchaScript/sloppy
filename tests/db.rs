@@ -1,6 +1,7 @@
 //! Row 2 and row 3 of the plan: root cell, transactions, revision, the change
 //! stream, watches, `compact`.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use sloppy::db::{Change, ChangeIterator, Db, Index, Key, Revision, Table, Version};
@@ -1164,4 +1165,100 @@ fn table_and_compact_leave_the_revision_where_it_was() {
     assert_eq!(w.commit(), 4);
     // The reader lost the deletion the compaction dropped.
     assert_eq!(slow.next(&db.read()).err().map(|e| e.at), Some(3));
+}
+
+/// A commit that panics partway through has already written part of itself to
+/// the trees under a revision it never published. There is no undo, so the
+/// database takes no further writes rather than letting the next commit take
+/// that revision and publish them.
+#[test]
+fn a_panicked_commit_stops_the_writer() {
+    /// Panics on one row, so a commit fails between two keys.
+    fn tenants_or_panic(r: &Row) -> Vec<Key> {
+        assert_ne!(r.key, "boom", "the index panics on this row");
+        row_tenants(r)
+    }
+    let by_tenant = Index {
+        name: "tenant",
+        keys: tenants_or_panic,
+    };
+
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[by_tenant]);
+
+    let commit = catch_unwind(AssertUnwindSafe(|| {
+        let mut w = db.write();
+        rows.insert(&mut w, row("r1", &["a"]));
+        rows.insert(&mut w, row("boom", &["a"]));
+        w.commit()
+    }));
+    assert!(commit.is_err(), "the index panicked while applying");
+
+    // A read runs on, at the revision the last whole commit published.
+    let r = db.read();
+    assert_eq!(r.revision(), 0);
+    assert!(rows.get(&r, b"r1").is_none(), "never published");
+
+    let refused = catch_unwind(AssertUnwindSafe(|| db.write()))
+        .err()
+        .expect("the next write is refused");
+    let message = *refused.downcast::<String>().expect("a panic message");
+    assert!(
+        message.contains("panicked partway through revision 1"),
+        "{message}"
+    );
+}
+
+/// A row written often enough carries a chain as long as its history, and the
+/// chain is let go one link at a time rather than one stack frame at a time.
+#[test]
+fn a_long_version_chain_is_dropped_without_recursion() {
+    let db = Db::new();
+    let items = db.table("items", pk as fn(&Item) -> Key, &[]);
+    for val in 0..200_000 {
+        let mut w = db.write();
+        items.insert(&mut w, item("a", val));
+        w.commit();
+    }
+    drop(db);
+}
+
+/// A row loaded and then written in one transaction: the write follows the
+/// chain the load put there, and leaves the record a write leaves.
+#[test]
+fn a_write_over_a_loaded_row_keeps_its_versions() {
+    let db = Db::new();
+    let rows = db.table("rows", row_pk as fn(&Row) -> Key, &[BY_TENANT]);
+
+    let mut w = db.write_at(5);
+    rows.load(
+        &mut w,
+        b"r1",
+        vec![
+            version(3, row("r1", &["a"]), false),
+            version(4, row("r1", &["b"]), false),
+        ],
+    );
+    rows.insert(&mut w, row("r1", &["c"]));
+    assert_eq!(
+        rows.versions(&w, b"r1")
+            .iter()
+            .map(|v| (v.revision, v.value.tenants))
+            .collect::<Vec<_>>(),
+        [(3, &["a"][..]), (4, &["b"][..]), (5, &["c"][..])],
+        "the transaction reads the load under its own write"
+    );
+    assert_eq!(w.commit(), 5);
+
+    let r = db.read();
+    assert_eq!(
+        rows.versions(&r, b"r1")
+            .iter()
+            .map(|v| (v.revision, v.value.tenants))
+            .collect::<Vec<_>>(),
+        [(3, &["a"][..]), (4, &["b"][..]), (5, &["c"][..])],
+    );
+    // The indexes follow the newest version, whichever put it there.
+    assert_eq!(by_tenant(&db, rows, "c"), ["r1"]);
+    assert!(by_tenant(&db, rows, "b").is_empty());
 }
