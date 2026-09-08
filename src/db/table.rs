@@ -217,12 +217,11 @@ impl<V> Clone for Table<V> {
 impl<V> Copy for Table<V> {}
 
 /// The rows of one table read at `at`, with the writes a transaction buffered
-/// over them at `revision`, in key order. A buffered key stands in for the row.
+/// over them, in key order. A buffered key stands in for the row.
 fn merged<V>(
     rows: tree::Iter<Row<V>>,
-    buffered: Vec<(Key, Op<V>)>,
+    buffered: Vec<Pending<V>>,
     at: Revision,
-    revision: Revision,
 ) -> impl Iterator<Item = (Key, Arc<V>, Revision)> + use<V> {
     let mut rows = rows.peekable();
     let mut buffered = buffered.into_iter().peekable();
@@ -232,15 +231,15 @@ fn merged<V>(
                 (None, None) => return None,
                 (Some(_), None) => false,
                 (None, Some(_)) => true,
-                (Some((row, _)), Some((key, _))) => key <= row,
+                (Some((row, _)), Some(pending)) => pending.key <= *row,
             };
             let live = if take_buffered {
-                let (key, op) = buffered.next().expect("just peeked");
-                if rows.peek().is_some_and(|(row, _)| *row == key) {
+                let pending = buffered.next().expect("just peeked");
+                if rows.peek().is_some_and(|(row, _)| *row == pending.key) {
                     rows.next();
                 }
-                let version = op.newest(revision);
-                (!version.deleted).then_some((key, version.value, version.revision))
+                let version = pending.newest().clone();
+                (!version.deleted).then_some((pending.key, version.value, version.revision))
             } else {
                 let (key, row) = rows.next().expect("just peeked");
                 row.live(at).map(|(value, revision)| (key, value, revision))
@@ -301,9 +300,9 @@ impl<V: Send + Sync + 'static> Table<V> {
     #[must_use]
     pub fn get(&self, txn: &impl Snapshot, key: &[u8]) -> Option<(Arc<V>, Revision)> {
         match txn.buffered(self, key) {
-            Some(op) => {
-                let version = op.newest(txn.revision());
-                (!version.deleted).then_some((version.value, version.revision))
+            Some(pending) => {
+                let version = pending.newest();
+                (!version.deleted).then_some((version.value.clone(), version.revision))
             }
             None => self
                 .with(txn.shared(), |entry| entry.primary.get(key))
@@ -331,16 +330,7 @@ impl<V: Send + Sync + 'static> Table<V> {
         };
         match txn.buffered(self, key) {
             None => stored(),
-            Some(Op::Load(versions)) => versions,
-            Some(Op::Write { value, deleted }) => {
-                let mut versions = stored();
-                versions.push(Version {
-                    revision: txn.revision(),
-                    value,
-                    deleted,
-                });
-                versions
-            }
+            Some(pending) => pending.versions(stored),
         }
     }
 
@@ -405,9 +395,9 @@ impl<V: Send + Sync + 'static> Table<V> {
         let buffered = txn
             .buffer(self)
             .into_iter()
-            .skip_while(|(key, _)| **key < *from)
+            .skip_while(|pending| *pending.key < *from)
             .collect();
-        merged(rows, buffered, txn.at(), txn.revision())
+        merged(rows, buffered, txn.at())
     }
 
     /// Every value listed under `key` in the named index, in primary key order,
@@ -487,13 +477,12 @@ impl<V: Send + Sync + 'static> Table<V> {
         let value = Arc::new(value);
         let key = self.with(&txn.db.shared, |entry| (entry.primary_key)(&value));
         let was = self.get(txn, &key).map(|(value, _)| value);
-        self.buffer(txn).put(
-            key,
-            Op::Write {
-                value,
-                deleted: false,
-            },
-        );
+        let version = Version {
+            revision: txn.revision,
+            value,
+            deleted: false,
+        };
+        self.buffer(txn).wrote(key, version);
         was
     }
 
@@ -505,19 +494,20 @@ impl<V: Send + Sync + 'static> Table<V> {
     /// If the table was not registered in this `Db`.
     pub fn delete(&self, txn: &mut WriteTxn<'_>, key: &[u8]) -> Option<Arc<V>> {
         let old = self.get(txn, key).map(|(value, _)| value)?;
-        self.buffer(txn).put(
-            key.into(),
-            Op::Write {
-                value: old.clone(),
-                deleted: true,
-            },
-        );
+        let version = Version {
+            revision: txn.revision,
+            value: old.clone(),
+            deleted: true,
+        };
+        self.buffer(txn).wrote(key.into(), version);
         Some(old)
     }
 
     /// Puts `versions` at `key`, in place of whatever is there, and leaves no
     /// change record: this is how a table is rebuilt from what was persisted,
-    /// not a write for readers to follow.
+    /// not a write for readers to follow. In place of whatever is there covers
+    /// a write this transaction has already made at `key`; an `insert` or a
+    /// `delete` after this one goes on the end of the chain loaded here.
     ///
     /// The indexes follow the newest version, so a row loaded as deleted is
     /// listed nowhere.
@@ -552,7 +542,7 @@ impl<V: Send + Sync + 'static> Table<V> {
             versions.iter().is_sorted_by(|a, b| a.revision < b.revision),
             "loaded versions are not in ascending revision order"
         );
-        self.buffer(txn).put(key.into(), Op::Load(versions));
+        self.buffer(txn).loaded(key.into(), versions);
     }
 
     /// A reader of this table's changes, observing it from where it stands now:
@@ -572,46 +562,43 @@ impl<V: Send + Sync + 'static> Table<V> {
     }
 }
 
-/// One buffered write.
+/// What a transaction leaves at one key: the chain a load put in place of the
+/// row, then the version an insert or a delete left on top of it. A load with a
+/// write over it is a row rebuilt and then written, and the write follows the
+/// chain the load put there.
 pub(super) struct Pending<V> {
     pub(super) key: Key,
-    pub(super) op: Op<V>,
+    /// The whole chain, in place of what the row holds. No change record.
+    pub(super) loaded: Option<Vec<Version<V>>>,
+    /// One version, at the transaction's revision, over what is below it.
+    pub(super) wrote: Option<Version<V>>,
 }
 
-/// What a transaction leaves at a key.
-pub(super) enum Op<V> {
-    /// An insert or a delete: one version, at the transaction's revision.
-    Write { value: Arc<V>, deleted: bool },
-    /// A load: the whole chain, in place of what is there.
-    Load(Vec<Version<V>>),
-}
-
-impl<V> Clone for Op<V> {
+impl<V> Clone for Pending<V> {
     fn clone(&self) -> Self {
-        match self {
-            Self::Write { value, deleted } => Self::Write {
-                value: value.clone(),
-                deleted: *deleted,
-            },
-            Self::Load(versions) => Self::Load(versions.clone()),
+        Self {
+            key: self.key.clone(),
+            loaded: self.loaded.clone(),
+            wrote: self.wrote.clone(),
         }
     }
 }
 
-impl<V> Op<V> {
-    /// The version this write leaves at the head of the row.
-    pub(super) fn newest(&self, revision: Revision) -> Version<V> {
-        match self {
-            Self::Write { value, deleted } => Version {
-                revision,
-                value: value.clone(),
-                deleted: *deleted,
-            },
-            Self::Load(versions) => versions
-                .last()
-                .expect("a loaded row holds a version")
-                .clone(),
-        }
+impl<V> Pending<V> {
+    /// The version this leaves at the head of the row.
+    pub(super) fn newest(&self) -> &Version<V> {
+        self.wrote
+            .as_ref()
+            .or_else(|| self.loaded.as_ref().and_then(|versions| versions.last()))
+            .expect("a pending write holds a version")
+    }
+
+    /// The versions a reader of this key sees, oldest first: the loaded chain,
+    /// or `stored` when this key was not loaded, and then the write.
+    pub(super) fn versions(self, stored: impl FnOnce() -> Vec<Version<V>>) -> Vec<Version<V>> {
+        let mut versions = self.loaded.unwrap_or_else(stored);
+        versions.extend(self.wrote);
+        versions
     }
 }
 
@@ -633,17 +620,33 @@ impl<V> Default for Buffer<V> {
 }
 
 impl<V> Buffer<V> {
-    fn put(&mut self, key: Key, op: Op<V>) {
-        if let Some(&at) = self.at.get(&key) {
-            self.pending[at].op = op;
-        } else {
-            self.at.insert(key.clone(), self.pending.len());
-            self.pending.push(Pending { key, op });
+    /// This key's place in the buffer, opened on first use.
+    fn entry(&mut self, key: Key) -> &mut Pending<V> {
+        let at = *self.at.entry(key.clone()).or_insert(self.pending.len());
+        if at == self.pending.len() {
+            self.pending.push(Pending {
+                key,
+                loaded: None,
+                wrote: None,
+            });
         }
+        &mut self.pending[at]
     }
 
-    pub(super) fn written(&self, key: &[u8]) -> Option<&Op<V>> {
-        self.at.get(key).map(|&at| &self.pending[at].op)
+    /// Leaves `version` on top of the key, in place of an earlier write of it.
+    fn wrote(&mut self, key: Key, version: Version<V>) {
+        self.entry(key).wrote = Some(version);
+    }
+
+    /// Puts `versions` in place of the row, and of anything written over it.
+    fn loaded(&mut self, key: Key, versions: Vec<Version<V>>) {
+        let pending = self.entry(key);
+        pending.loaded = Some(versions);
+        pending.wrote = None;
+    }
+
+    pub(super) fn written(&self, key: &[u8]) -> Option<&Pending<V>> {
+        self.at.get(key).map(|&at| &self.pending[at])
     }
 }
 
@@ -671,56 +674,51 @@ impl<V: Send + Sync + 'static> AnyBuffer for Buffer<V> {
             .downcast_ref()
             .expect("a table's buffer holds its value type");
         let mut buried = Revision::MAX;
-        for Pending { key, op } in self.pending {
-            let row = entry.primary.get(&key);
-            let had = row.as_ref().and_then(Row::held).cloned();
-            match op {
-                Op::Write { value, deleted } => {
-                    let is = (!deleted).then(|| value.clone());
-                    if deleted {
-                        buried = buried.min(at.revision);
-                    }
-                    if reindex(
-                        &entry.indexes,
-                        &key,
-                        had.as_ref(),
-                        is.as_ref(),
-                        at.revision,
-                        at.compacted,
-                    ) {
-                        buried = buried.min(at.revision);
-                    }
-                    let version = Version {
-                        revision: at.revision,
-                        value,
-                        deleted,
-                    };
-                    entry
-                        .primary
-                        .insert(&key, Row::written(row, version, at.compacted));
-                    at.changes
-                        .insert(&stream_key(at.pos, at.revision, at.seq), key);
-                    at.seq += 1;
+        for Pending { key, loaded, wrote } in self.pending {
+            let mut row = entry.primary.get(&key);
+            if let Some(versions) = loaded {
+                let had = row.as_ref().and_then(Row::held).cloned();
+                let loaded = Row::loaded(&versions);
+                let revision = loaded.newest().revision;
+                if let Some(revision) = loaded.tombstoned() {
+                    buried = buried.min(revision);
                 }
-                Op::Load(versions) => {
-                    let loaded = Row::loaded(&versions);
-                    if let Some(revision) = loaded.tombstoned() {
-                        buried = buried.min(revision);
-                    }
-                    let revision = loaded.newest().revision;
-                    if reindex(
-                        &entry.indexes,
-                        &key,
-                        had.as_ref(),
-                        loaded.held(),
-                        revision,
-                        at.compacted,
-                    ) {
-                        buried = buried.min(revision);
-                    }
-                    entry.primary.insert(&key, loaded);
+                if reindex(
+                    &entry.indexes,
+                    &key,
+                    had.as_ref(),
+                    loaded.held(),
+                    revision,
+                    at.compacted,
+                ) {
+                    buried = buried.min(revision);
                 }
+                row = Some(loaded);
             }
+            if let Some(version) = wrote {
+                let had = row.as_ref().and_then(Row::held).cloned();
+                let is = (!version.deleted).then(|| version.value.clone());
+                if version.deleted {
+                    buried = buried.min(at.revision);
+                }
+                if reindex(
+                    &entry.indexes,
+                    &key,
+                    had.as_ref(),
+                    is.as_ref(),
+                    at.revision,
+                    at.compacted,
+                ) {
+                    buried = buried.min(at.revision);
+                }
+                row = Some(Row::written(row, version, at.compacted));
+                at.changes
+                    .insert(&stream_key(at.pos, at.revision, at.seq), key.clone());
+                at.seq += 1;
+            }
+            entry
+                .primary
+                .insert(&key, row.expect("a pending write leaves a row"));
         }
         entry.state.revision.store(at.revision, Ordering::Release);
         if buried < Revision::MAX {

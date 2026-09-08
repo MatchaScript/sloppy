@@ -28,6 +28,19 @@ struct Link<V> {
     prev: Option<Arc<Link<V>>>,
 }
 
+/// A chain is as long as the row's history, so the links go one at a time:
+/// the derived drop would recurse once per version and run the stack out.
+impl<V> Drop for Link<V> {
+    fn drop(&mut self) {
+        let mut next = self.prev.take();
+        while let Some(link) = next {
+            // A link another chain still holds ends this walk; it will be
+            // dropped, and carry on from there, when that chain lets it go.
+            next = Arc::into_inner(link).and_then(|mut link| link.prev.take());
+        }
+    }
+}
+
 /// A row: the head of its version chain. A write is one allocation, the link
 /// that points at what was there.
 pub(super) struct Row<V> {
